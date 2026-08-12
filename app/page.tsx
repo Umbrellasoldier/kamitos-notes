@@ -12,15 +12,25 @@ export default function Home() {
 
   return (
     <main>
-      <section className="hero shell" aria-labelledby="hero-title">
-        <div className="hero-copy">
-          <p className="eyebrow">KAMITO&apos;S NOTES · 个人博客</p>
-          <h1 id="hero-title">记录技术、生活与思考</h1>
-          <p className="hero-lead">
+      <section className="home-banner shell" aria-labelledby="home-banner-title">
+        <h1 className="visually-hidden" id="home-banner-title">
+          Kamito&apos;s Notes：记录技术、生活与思考
+        </h1>
+        <div className="banner-frame">
+          <img
+            src="/og.png"
+            alt=""
+            width="1731"
+            height="909"
+            fetchPriority="high"
+          />
+        </div>
+        <div className="home-intro">
+          <p>
             你好，我是 Kamito。这里收集正在探索的问题、值得留下的日常，
             以及那些还没有标准答案的想法。
           </p>
-          <div className="hero-actions">
+          <div className="home-intro-actions">
             <Link className="button button-primary" href="/posts">
               阅读文章
             </Link>
@@ -28,17 +38,6 @@ export default function Home() {
               关于我
             </Link>
           </div>
-        </div>
-        <div className="avatar-stage" aria-label="Kamito 的头像">
-          <span className="avatar-orbit" aria-hidden="true" />
-          <img
-            className="hero-avatar"
-            src="/avatar.png"
-            alt="Kamito 的粉色动漫人物头像"
-            width="858"
-            height="668"
-          />
-          <span className="avatar-caption">保持好奇，持续记录。</span>
         </div>
       </section>
 
