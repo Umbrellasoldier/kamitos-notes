@@ -7,11 +7,10 @@ type SiteLinkProps = Omit<ComponentPropsWithoutRef<"a">, "href"> & {
 export default function SiteLink({
   href,
   children,
-  target = "_top",
   ...props
 }: SiteLinkProps) {
   return (
-    <a href={href} target={target} {...props}>
+    <a href={href} {...props}>
       {children}
     </a>
   );
