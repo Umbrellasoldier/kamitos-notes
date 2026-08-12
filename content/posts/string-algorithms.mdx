@@ -1,0 +1,225 @@
+---
+title: "字符串算法专题：从 KMP 到 AC 自动机"
+description: "以 Border 为主线梳理 KMP、字符串哈希、Trie、Border 树和 AC 自动机，并配合典型题目记录解法。"
+publishedAt: "2024-04-15"
+updatedAt: "2026-08-13"
+category: "技术"
+tags:
+  - "算法竞赛"
+  - "字符串"
+  - "KMP"
+  - "Trie"
+featured: false
+draft: false
+---
+
+这篇笔记以字符串的前后缀关系为主线，把 KMP、字符串哈希、Trie、Border 树和 AC 自动机串在一起，并穿插对应练习。它不是从零开始的教材，更适合作为掌握基础概念后的复习索引。
+
+## 基础概念
+
+- **字符位置**：$S[i]$ 表示字符串 $S$ 的第 $i$ 个字符，本文默认下标从 $1$ 开始。
+- **前缀与后缀**：$Prefix_S(i)=S[1,i]$，$Suffix_S(i)=S[|S|-i+1,|S|]$。
+- **Border**：若某个长度的前缀与同长度后缀相同，则这个前缀（或后缀）是 $S$ 的一个 Border。字符串本身也可视为平凡 Border。
+- **周期**：若正整数 $p$ 满足对所有 $p<i\le |S|$ 都有 $S[i]=S[i-p]$，则 $p$ 是 $S$ 的周期。
+- **循环节**：若周期 $p$ 还满足 $p\mid |S|$，则 $p$ 是 $S$ 的循环节。
+
+### 重要性质
+
+- $p$ 是 $S$ 的周期，当且仅当 $|S|-p$ 是 $S$ 的 Border。
+- Border 具有传递性：$S$ 的 Border 的 Border 仍是 $S$ 的 Border。
+- 求 $S$ 的所有 Border，可以转化为沿每个前缀的最大 Border 继续向上追溯。
+- 若 $p,q$ 都是 $S$ 的周期，并满足 Fine–Wilf 定理所需的长度条件，则 $\gcd(p,q)$ 也是 $S$ 的周期。
+- 一个字符串至多有 $O(n)$ 个 Border；这些长度还可以进一步压缩成少量等差数列表示。
+
+## [KMP](https://ac.nowcoder.com/acm/contest/27589)
+[字符串的问题](https://ac.nowcoder.com/acm/problem/15165)
+[code](https://ac.nowcoder.com/acm/contest/view-submission?submissionId=69066676&returnHomeType=1&uid=109695102)
+
+[[模板]KMP字符串匹配](https://ac.nowcoder.com/acm/contest/27589/A)
+[code](https://ac.nowcoder.com/acm/contest/view-submission?submissionId=69068304)
+
+[数一数](https://ac.nowcoder.com/acm/contest/27589/B)
+长度大的串在长度小的串中出现的次数为$0$ ，所以非最小的串的答案必定为$0$。
+最小的串中，如果不相等，则互相出现在对方的次数为$0$。
+否则只存在一种最小串，求这种串出现其他串的次数($kmp$）。
+[code](https://ac.nowcoder.com/acm/contest/view-submission?submissionId=69134472)
+
+[栗酱的数列](https://ac.nowcoder.com/acm/contest/27589/C)
+要求
+
+$$
+(a'_1+b_1)\bmod k=(a'_2+b_2)\bmod k=\cdots=(a'_m+b_m)\bmod k.
+$$
+
+相邻两式作差后可得
+
+$$
+(a'_i-a'_{i+1})\bmod k=(b_{i+1}-b_i)\bmod k,
+\qquad 1\le i<m.
+$$
+
+令 $DiffA[i]=a'[i]-a'[i+1]$，$DiffB[i]=b[i+1]-b[i]$。问题就转化为：在长度为 $n-1$ 的 $DiffA$ 中，统计长度为 $m-1$ 的 $DiffB$ 出现了多少次，可以直接使用 KMP。
+[code](https://ac.nowcoder.com/acm/contest/view-submission?submissionId=69068341)
+
+[K匹配 ](https://ac.nowcoder.com/acm/contest/27589/D)
+求$S$ 中有多少子串包含$T$
+$KMP$ 求出所有$T$ 左右端点坐标，对于每个子串$T$，求以它为最后一个被包含的$T$ 的子串数量：左端点坐标×（下一个子串右端点坐标-右端点坐标）。
+[code](https://ac.nowcoder.com/acm/contest/view-submission?submissionId=69134511)
+
+[carpet](https://ac.nowcoder.com/acm/contest/27589/E)
+求最小二维循环周期：分别对行和列求最小循环周期。
+求所有行的最小循环周期：求出每行的所有循环周期，取一个最小的公共周期$q$。
+注意：不是所有行的最小循环周期的$lcm$。
+列同理。
+对于固定大小的矩阵，最小化矩阵最大值：二维单调队列求每个矩阵的最大值，再取最小值即可。
+[code](https://ac.nowcoder.com/acm/contest/view-submission?submissionId=69142415)
+
+
+## 字符串Hash
+字符串哈希把字符串映射为定长整数，用很小的碰撞概率换取快速比较。它并不是严格单射；竞赛中通常使用随机基数、双模数或 64 位自然溢出来降低碰撞风险。
+[good hash table primes](https://planetmath.org/goodhashtableprimes)
+[字符串哈希](https://www.acwing.com/problem/content/description/843/)
+[code](https://www.acwing.com/problem/content/submission/code_detail/34764858/)随机双模hash
+回文串:
+给出一个字符串 $S$，每次操作可以删除最末尾的一个字符，最少进行多少次操作可以得到一个回文串。
+解法：求出每个前缀和后缀的$hash$ 值，每删除一个末尾字符比较当前前缀和后缀的$hash$ 值是否相等。
+
+子串字典序比较$1$：
+给出一个正整数数组 $A$，长度不超过 $100, 000$，以及 $Q ≤ 100, 000$ 次询
+问：子串 $A[l1, r1]$ 和 $A[l2, r2]$ 的字典序大小关系。
+解法：二分两个子串的$LCP$ ，$hash$ 来$check$ ，然后比较后面一个字符的大小。$O(Qlog(n))$
+
+子串字典序比较 $2$：
+给出一个正整数数组 $A$，长度不超过 $100, 000$，以及 $Q ≤ 100, 000$ 次操
+作：
+询问：子串 $A[l1, r1]$ 和 $A[l2, r2]$ 的字典序大小关系。
+修改：将 $A[x]$ 的值替换为 $y$。
+解法：线段树维护 $hash$，区间合并满足 $hash(A+B)=hash(A)\cdot base^{|B|}+hash(B)$。
+查询仍然二分$LCP$，$hashcheck$。
+
+子串字典序比较 $3$：
+给出一个正整数数组 $A$，长度不超过 $100, 000$，以及 $Q ≤ 100, 000$ 次操
+作：
+询问：子串 $A[l1, r1]$ 和 $A[l2, r2]$ 的字典序大小关系。
+修改：将区间 $[l, r]$ 位置的数字值增加 $1$。
+解法：用支持区间修改的线段树维护 $hash$。区间整体增加 $1$ 时，对应的哈希增量为 $1+Base+Base^2+\cdots+Base^{|A|-1}$。
+
+[E. Kefa and Watch](https://codeforces.com/problemset/problem/580/E)
+给出一个数组 $A$，进行 $Q$ 次操作：
+询问：$p$ 是否是区间 $[L, R]$ 的周期。
+修改：将区间 $[L, R]$ 的数字赋值为 $k$。
+解法：
+询问：$p$ 是否是区间 $[L, R]$ 的周期，即$[L,R-p]$ 是否是$[L,R]$ 的$Border$，
+即$[L,R-p]$ 是否等于 $[L+p,R]$，$hash$ 检查。
+修改：区间修改线段树维护$hash$。
+[code](https://codeforces.com/contest/580/submission/258580870)
+
+[【模板】扩展 KMP/exKMP（Z 函数）](https://www.luogu.com.cn/problem/P5410)
+[扩展 KMP（Z 函数）](https://www.luogu.com.cn/article/cq4b4e5f)
+[code](https://www.luogu.com.cn/record/157814950)
+
+[子串查询](https://ac.nowcoder.com/acm/contest/28576/A)
+对$s$ 做一遍序列自动机，找到任一字符在$s[i]$ 的后面第一次出现的位置。
+每一次询问时从前往后扫$t$，在$s$ 上往后跳。每次询问的时间复杂度为$O(|t|)$。
+
+[快乐的JYY](https://ac.nowcoder.com/acm/contest/28576/D)
+二分哈希找出$A$ 的每个位置的最大回文半径(分奇数长度和偶数长度)，得到所有的极长回文串$O(2n)$。
+将每个极长回文串向里缩，得到所有的本质不同回文串$O(n)$，同时统计出现次数。
+同样处理$B$。
+将$A$ 和$B$ 中相同的回文串出现次数相乘取和。
+[code](https://ac.nowcoder.com/acm/contest/view-submission?submissionId=69169419)
+
+
+## Trie
+[假的字符串](https://ac.nowcoder.com/acm/contest/28737/A)
+trie存字符串。
+依次判断每个字符串是否可能为最小字符串.
+1.若存在前缀字符串，则不可能。
+2.对于trie上的每个节点的后继，$s_i$ 所在的节点一定比其他后继节点小，将$s_i$ 所在的节点的字符与其他后继节点的字符建边。最后跑一遍拓扑排序判无环即可。
+(坑点：卡内存)
+[code](https://ac.nowcoder.com/acm/contest/view-submission?submissionId=68921536)
+
+[The XOR Largest Pair ](https://ac.nowcoder.com/acm/contest/28737/B)
+01Trie裸题。
+[code](https://ac.nowcoder.com/acm/contest/view-submission?submissionId=68927397)
+
+[奶牛异或](https://ac.nowcoder.com/acm/contest/28737/C)
+做一遍异或前缀和，然后01Trie。
+[code](https://ac.nowcoder.com/acm/contest/view-submission?submissionId=68927611)
+
+**最大异或和**
+做一遍异或前缀和，查询可以化简为：找一个 $l-1\le p<r-1$，使 $a_p\oplus X$ 最大，其中 $X=a_n\oplus x$。
+可持久化Trie:每个前缀都有一棵Trie，每次只对新增的数建节点，其余部分直接连到前面的Trie的节点上，对每个节点记录一个已有个数$cnt$。
+查询:从$l-1$ 和$r-1$ 的根节点开始，对于$X$ 的当前位上的数$u$ ，若$cnt[trie[r][1-u]]-cnt[trie[l][1-u]]>=1$ ，则说明$l$ 到$r$ 这个区间内这一位上存在$1-u$ ，往$1-u$ 走，$res+=1<<i$，否则往$u$ 走。
+
+[code](https://ac.nowcoder.com/acm/contest/view-submission?submissionId=68948832)
+
+
+## Border树(KMP建树)
+定义：
+对于一个字符串 $S$，$n = |S|$，它的 $Border$ 树（也叫 $next$ 树）共有 $n + 1$ 个节点：$0, 1, 2, . . . , n$。
+$0$ 是这棵有向树的根。对于其他每个点 $1 ≤ i ≤ n$，父节点为 $next[i]$。
+性质
+1.每个前缀 $Prefix[i]$ 的所有 $Border$：节点 $i$ 到根的链。
+2.哪些前缀有长度为 $x$ 的 $Border$：$x$ 的子树。
+3.求两个前缀的公共 $Border$ 等价于求 $LCA$。
+
+[[模板]失配树](https://www.luogu.com.cn/problem/P5829)
+先$KMP$ 跑出$next[]$ ，再根据$next[]$ 建立$Border$ 树。
+求最长公共前缀等价于求$LCA$ 。
+注意：
+1.$next[]$ 中的$0$ 是真实节点，而$LCA$ 中的$0$ 是虚拟节点。所以建树时要给每个点的编号加个偏移量$1$。
+2.求$LCA$ 时可能某个点就是$LCA$，但$next[]$ 是指最大非平凡$Border$ ，不能等于自身，应该取父节点$fa[p][0]$。
+
+[葫芦和斌斌的字符串1](https://ac.nowcoder.com/acm/contest/28737/F)
+$1$ 和$2$ 等价于求$S$ 的$Border$。
+$T$ 的出现次数等价于其子树的大小。
+建立$Border$ 树，从$n$ 向上爬，直到该节点子树大小大于$k$。
+$KMP$ 和建$Border$ 树$O(n)$，查询$O(log_2n)$。
+[code](https://ac.nowcoder.com/acm/contest/view-submission?submissionId=69151417)
+
+[葫芦和斌斌的字符串2 ](https://ac.nowcoder.com/acm/problem/233500)
+离线把最终$Border$ 树建出来，求出$dfs$ 序，就可以得到每个节点的子树所构成的$dfs$ 序区间。
+每次加一个点就相当于给$dfs$ 序的某个单点加一。
+查询一个子树的大小相当于在$dfs$ 序上求这个子树所在区间的和。
+找最长的$T$ 可以二分高度或者链上倍增。
+$KMP$、建$Border$ 树、求$dfs$ 序$O(n)$，单点修改$O(log_2n)$，区间查询$O(log_2n)$。
+[code](https://ac.nowcoder.com/acm/contest/view-submission?submissionId=69153083&returnHomeType=1&uid=109695102)
+
+
+
+## AC自动机
+$AC$ 自动机 = $Trie$ + $KMP$
+$AC$ 自动机基于 $Trie$，将 $KMP$ 的 $Border$ 概念推广到多模式串上。
+$AC$ 自动机是一种离线型数据结构，即不支持增量添加新的字符串。
+$AC$ 自动机常用于将字符串询问类的问题进行离线处理，也经常与各种$DP$ 结合，或是补全成 $Trie$ 图。
+广义 $border$:
+推广到两个串：对于两个串 $S$ 和 $T$ ，相等的 $p$ 长度的 $S$ 的后缀和 $T$ 的前缀称为一个 $border$。
+推广到一个字典：对于串 $S$ 和一个字典 $D$，相等的 $p$ 长度的 $S$ 的后缀，和任意一个字典串 $T$ 的前缀称为一个 $border$。
+失配（$Fail$）指针：
+对于 $Trie$ 中的每一个节点（即某个字典串的前缀），它与 $Trie$ 中所有串的最大 $Border$ 即为失配指针。
+类似于 $KMP$ 求 $Border$，任意节点的 $Border$ 长度减一，一定是父节点的$Border$。
+因此可以通过遍历父节点的失配指针链来求解。
+因此在求失配指针的时候，一定要按长度从小到大来求，即 $bfs$。
+复杂度分析:
+类似于 $KMP$ 的势能分析方法，势能总量等于 $Trie$ 的节点总数，因此复杂度为线性的。
+
+[模板】AC 自动机（二次加强版）](https://ac.nowcoder.com/acm/contest/29086/A)
+优化：
+1.
+```
+if(!trie[u][i])
+	trie[u][i]=trie[fail[u]][i]
+```
+2.拓扑优化建图，防止查询每个模式的次数时只能暴力跳$fail$ ，最坏达到$O(|S|·|T|)$。
+[code](https://ac.nowcoder.com/acm/contest/view-submission?submissionId=69193987)
+3.$fail$ 子树求和。拓扑建图是从树枝往树根推，子树求和是利用$dfs$ 从根往下。
+[code](https://ac.nowcoder.com/acm/contest/view-submission?submissionId=69198548)
+
+[string ](https://ac.nowcoder.com/acm/contest/29086/B)
+$AC$ 自动机是离线数据结构，不支持动态修改，考虑离线。
+先把最终的$fail$ 树建出来，求出$dfs$ 序。
+修改只要修改两个标记节点即可$(add(in[p],1)),add(out[p],-1)$。
+查询就是在$trie$ 上遍历匹配这个字符串时，对于每个到达的节点，加上$fail$ 上这个节点到根上所有节点的标记值。
+单点修改，区间查询，树状数组维护$dfs$ 序上每个点到根的终止节点数。
+[code](https://ac.nowcoder.com/acm/contest/view-submission?submissionId=69204814)

@@ -1,0 +1,1849 @@
+---
+title: "算法竞赛进阶指南：基本算法与数据结构"
+description: "一份持续整理的算法竞赛手册，覆盖位运算、递归、前缀和、二分、排序、倍增、贪心与基础数据结构。"
+publishedAt: "2026-01-09"
+updatedAt: "2026-08-13"
+category: "技术"
+tags:
+  - "算法竞赛"
+  - "基础算法"
+  - "数据结构"
+featured: true
+draft: false
+---
+
+这是一份持续整理的算法竞赛学习笔记，按照《算法竞赛进阶指南》的章节组织，重点记录基本算法、贪心方法与基础数据结构。每个条目尽量保留解题思路、复杂度和可复用代码，方便复习时快速定位。
+
+> 这篇长文更像一份可检索的个人手册：适合按目录跳读，也会随着学习继续补充。
+
+## 0x00 基本算法
+### 0x01 位运算
+
+#### [a^b](https://www.luogu.com.cn/problem/P1226)
+快速幂板子 $O(log(b))$
+```cpp
+
+i64 fastpow(i64 a,i64 b,i64 p) {
+    i64 res=1%p;
+    while(b){
+        if(b&1){
+            res=res*a%p;
+        }
+        a=a*a%p;
+        b>>=1;
+    }
+    return res;
+}
+
+void solve(){
+    int a,b,p;
+    cin>>a>>b>>p;
+
+    cout<<a<<"^"<<b<<" "<<"mod "<<p<<"="<<fastpow(a,b,p)<<"\n";
+
+    return;
+}
+
+```
+
+#### [64位整数乘法](https://www.luogu.com.cn/problem/P10446)
+龟速乘板子 $O(log(b))$
+```cpp
+i64 slowmul(i64 a,i64 b,i64 p){
+    i64 res=0;
+    while(b){
+        if(b&1){
+            res=(res+a)%p;
+        }
+        a=a*2%p;
+        b>>=1;
+    }
+    return res;
+}
+
+void solve(){
+    i64 a,b,p;
+    cin>>a>>b>>p;
+    cout<<slowmul(a,b,p)<<"\n";
+    return;
+}
+```
+
+自然溢出，$O(1)$：
+```cpp
+i64 overflowmul(u64 a,u64 b,u64 p){
+    a%=p,b%=p;
+    u64 c=(long double)a*b/p;
+    u64 x=a*b,y=c*p;
+    i64 ans=((i64)(x%p)-(i64)(y%p)+p)%p;
+    return ans;
+}
+
+void solve(){
+    i64 a,b,p;
+    cin>>a>>b>>p;
+    cout<<overflowmul(a,b,p)<<"\n";
+    return;
+}
+```
+
+#### [[NOI2014] 起床困难综合症](https://www.luogu.com.cn/problem/P2114)
+从高到低拆位计算，如果当前位置取1当且仅当加上后不超过m，且比取0经过n次运算后攻击力更高。 $O(nlog(m))$
+```cpp
+void solve(){
+    int n,m;
+    cin>>n>>m;
+
+    vector<int> op,t;
+    for(int i=0;i<n;i++){
+        string s;
+        int x;
+        cin>>s>>x;
+        if(s=="AND"){
+            op.push_back(0);
+        }else if(s=="OR"){
+            op.push_back(1);
+        }else{
+            op.push_back(2);
+        }
+        t.push_back(x);
+    }
+
+    auto calc=[&](int i,int j)->int{
+        int res=j<<i;
+        for(int k=0;k<n;k++){
+            int x=t[k]&(1<<i);
+            if(op[k]==0){
+                res&=x;
+            }else if(op[k]==1){
+                res|=x;
+            }else{
+                res^=x;
+            }
+        }
+        return res;
+    };
+
+    int x=0;
+    for(int i=30;i>=0;i--){
+        if((i64)x+(1<<i)>m){
+            continue;
+        }
+        int calc_0=calc(i,0),calc_1=calc(i,1);
+        if(calc_1>calc_0){
+            x+=1<<i;
+        }
+    }
+
+    for(int i=0;i<n;i++){
+        if(op[i]==0){
+            x&=t[i];
+        }else if(op[i]==1){
+            x|=t[i];
+        }else{
+            x^=t[i];
+        }
+    }
+
+    cout<<x<<"\n";
+
+
+}
+```
+
+##### trick:
+1. $\forall k \in [0,35],2^k\%37$ 互不相等，且恰好取遍整数1-36
+借此技巧将 $2^k$ 哈希
+```cpp
+int H[37];
+for(int i=0;i<36;i++){
+	H[(1ll<<i)%37]=i;
+}
+```
+2. cpp内置函数
+```cpp
+int __builtin_ctz(unsigned x)
+int __builtin_ctzll(unsigned long long x)
+// 返回x的二进制表示下最低位的1后边有多少个0
+
+int __builtin_popcount(unsigned int x)
+int __builtin_popcountll(unsigned long long x)
+// 返回x的二进制表示下有多少位为1
+```
+
+### 0x02 递推与递归
+#### [枚举子集（递归实现指数型枚举）](https://www.luogu.com.cn/problem/B3622)
+$O(2^n)$
+```cpp
+void solve(){
+    int n;
+    cin>>n;
+    string s="";
+    for(int i=0;i<n;i++){
+        s+='N';
+    }
+    auto dfs=[&](auto dfs,int i)->void{
+        if(i==n){
+            cout<<s<<"\n";
+            return;
+        }
+        s[i]='N';
+        dfs(dfs,i+1);
+        s[i]='Y';
+        dfs(dfs,i+1);
+        return;
+    };
+    dfs(dfs,0);
+}
+```
+
+#### [组合型枚举](https://www.luogu.com.cn/problem/P10448)
+$O(C_n^k)$
+```cpp
+void solve(){
+    int n,k;
+    cin>>n>>k;
+    vector<int> ans;
+    auto dfs=[&](auto dfs,int i)->void{
+        if(ans.size()==k){
+            for(int i=0;i<k;i++){
+                cout<<ans[i]<<" \n"[i==k-1];
+            }
+            return;
+        }
+        if(i>n||ans.size()+n-i+1<k){
+            return;
+        }
+        ans.push_back(i);
+        dfs(dfs,i+1);
+        ans.pop_back();
+        dfs(dfs,i+1);
+    };
+    dfs(dfs,1);
+}
+```
+
+#### [枚举排列（递归实现排列型枚举）](https://www.luogu.com.cn/problem/B3623)
+$O(n^k)$
+```cpp
+void solve(){
+    int n,k;
+    cin>>n>>k;
+    vector<int> ans;
+    vector<bool> chosen(n+1);
+    auto dfs=[&](auto dfs,int i)->void{
+        if(i==k+1){
+            for(int j=0;j<k;j++){
+                cout<<ans[j]<<" \n"[j==k-1];
+            }
+            return;
+        }
+        for(int j=1;j<=n;j++){
+            if(chosen[j])
+                continue;
+            chosen[j]=true;
+            ans.push_back(j);
+            dfs(dfs,i+1);
+            ans.pop_back();
+            chosen[j]=false;
+        }
+    };
+    dfs(dfs,1);
+}
+```
+
+#### [费解的开关](https://www.luogu.com.cn/problem/P10449)
+枚举第一行所有方案，再向下推，check能否成功。 $O(2^{n}n^2)$
+
+#### [奇怪的汉诺塔](https://www.acwing.com/problem/content/98/)
+4塔汉诺塔问题，可由3塔问题转化。
+3塔：设 $d_n$ 为将 n 个盘子从 A 转移到 C 的最小步数， $d_n=2d_{n-1}+1$。
+4塔：设 $f_n$ 为将 n 个盘子从 A 转移到 D 的最小步数，可以先把 i 个盘子在4塔模式下从 A 转移到 B，再将 n-i 个盘子在3塔模式下从A 转移到 D ，再将 i 个盘子在3塔模式下从B 转移到 D ， $f_n=\min\limits_{1\le i< n}\left\{2f_{i}+d_{n-i}\right\}$。
+
+$O(n^2)$
+
+#### [约数之和](https://www.acwing.com/problem/content/description/99/)
+将A质因数分解，$A=\prod\limits_i{p_i^{c_i}}$
+
+$A^B=\prod\limits_i{p_i^{c_iB}}$
+
+约数之和=$\prod\limits_i\sum\limits_j^{c_iB}{p_i^j}$
+
+设$C=c_iB$
+
+记 $S(C)=\sum_{j=0}^{C}p^j$。递归关系为
+
+$$
+\begin{aligned}
+S(C)&=(1+p^{C/2})S(C/2-1)+p^C, && C\equiv 0\pmod 2,\\
+S(C)&=(1+p^{(C+1)/2})S((C-1)/2), && C\equiv 1\pmod 2.
+\end{aligned}
+$$
+
+```cpp
+i64 fastpow(i64 a,i64 b,int p) {
+    i64 res=1%p;
+    while(b){
+        if(b&1){
+            res=res*a%p;
+        }
+        a=a*a%p;
+        b>>=1;
+    }
+    return res;
+}
+
+void solve(){
+    int a,b;
+    cin>>a>>b;
+
+    if(a==0){
+        cout<<0<<"\n";
+        return;
+    }
+
+    map<int,int> cnt;
+    for(int i=2;i<=a/i;i++){
+        if(a%i==0){
+            while(a%i==0){
+                cnt[i]++;
+                a/=i;
+            }
+        }
+    }
+    if(a>1){
+        cnt[a]++;
+    }
+
+    i64 ans=1;
+    int mod=9901;
+    auto sum=[&](auto sum,int p,i64 c)->i64{
+        if(c==0){
+            return 1;
+        }
+        if(c%2==0){
+            return (sum(sum,p,c/2-1)*(1+fastpow(p,c/2,mod))%mod+fastpow(p,c,mod))%mod;
+        }else{
+            return sum(sum,p,(c-1)/2)*(1+fastpow(p,(c+1)/2,mod))%mod;
+        }
+    };
+    for(auto [p,c]:cnt){
+        ans=ans*sum(sum,p,c*b)%mod;
+    }
+
+    cout<<ans<<"\n";
+}
+```
+
+#### [分形之城](https://www.acwing.com/problem/content/submission/code_detail/43722011/)
+解法1（标准解法）：在N级城市中查询编号为A的街区的位置，先在N-1级城市找到编号A%block街区的位置，再考虑通过坐标旋转和翻转以及平移得到在当前城市的位置。
+在不同形状的城市中的坐标旋转需要用到旋转矩阵。
+```python
+def pos(N,c):
+    if N==0:
+        return 0,0
+    block=4**(N-1)
+    length=1<<(N-1)
+    idx=c//block
+    c%=block
+    x,y=pos(N-1,c)
+    if idx==0:
+        return y,x
+    elif idx==1:
+        return x,y+length
+    elif idx==2:
+        return x+length,y+length
+    else:
+        return length*2-y-1,-x+length-1
+
+def solve():
+    n,a,b=MIIS()
+    a-=1
+    b-=1
+    xa,ya=pos(n,a)
+    xb,yb=pos(n,b)
+    dx=xa-xb
+    dx*=10
+    dy=ya-yb
+    dy*=10
+    print(int(sqrt(dx*dx+dy*dy)+0.5))
+    return
+
+test=1
+test=int(input())
+for _ in range(test):
+    solve()
+```
+解法2：大分讨，在N级形状为c的城市中查找编号为A的街区的位置，先在N-1级城市形状为d的城市中查询编号为A%block的街区的位置，再通过平移得到当前位置。
+```python
+def get(N,c,x):
+    if N==0:
+        return 0,0
+    s=4**(N-1)
+    y=(x-1)//s
+    x-=y*s
+    d=2**(N-1)
+    if c==0:
+        if y==0:
+            a,b=get(N-1,1,x)
+            return a,b
+        elif y==1:
+            a,b=get(N-1,0,x)
+            return a,b+d
+        elif y==2:
+            a,b=get(N-1,0,x)
+            return a+d,b+d
+        else:
+            a,b=get(N-1,2,x)
+            return a+d,b
+    elif c==1:
+        if y==0:
+            a,b=get(N-1,0,x)
+            return a,b
+        elif y==1:
+            a,b=get(N-1,1,x)
+            return a+d,b
+        elif y==2:
+            a,b=get(N-1,1,x)
+            return a+d,b+d
+        else:
+            a,b=get(N-1,3,x)
+            return a,b+d
+    elif c==2:
+        if y==0:
+            a,b=get(N-1,3,x)
+            return a+d,b+d
+        elif y==1:
+            a,b=get(N-1,2,x)
+            return a,b+d
+        elif y==2:
+            a,b=get(N-1,2,x)
+            return a,b
+        else:
+            a,b=get(N-1,0,x)
+            return a+d,b
+    else:
+        if y==0:
+            a,b=get(N-1,2,x)
+            return a+d,b+d
+        elif y==1:
+            a,b=get(N-1,3,x)
+            return a+d,b
+        elif y==2:
+            a,b=get(N-1,3,x)
+            return a,b
+        else:
+            a,b=get(N-1,1,x)
+            return a,b+d
+
+
+def solve():
+    n,a,b=MIIS()
+    xa,ya=get(n,0,a)
+    xb,yb=get(n,0,b)
+    print(int(sqrt((abs(xa-xb)*10)**2+(abs(ya-yb)*10)**2)+0.5))
+    return
+
+test=1
+test=int(input())
+for _ in range(test):
+    solve()
+```
+
+### 0x03 前缀和与差分
+#### [激光炸弹](https://www.acwing.com/problem/content/description/101/)
+二维差分，注意R最大取5001
+
+#### [增减序列](https://www.acwing.com/problem/content/description/102/)
+转化成差分序列，原数组全都相等等价于差分数组除第一位外全为0。
+
+可执行的操作：
+
+1. 选择两个端点，左加右减
+2. 选择两个端点，左减右加
+3. 选择单点加
+4. 选择单点减
+
+最少操作次数=max(加的次数，减的次数)
+
+序列个数=|加的次数-减的次数|+1，即除第一位外，最后那个不为0的数在执行操作的过程中也对第一个数操作，当然也可以不操作
+
+#### [最高的牛](https://www.acwing.com/problem/content/description/103/)
+l,r可以看见，则将l+1到r-1都减1
+
+### 0x04 二分
+#### [最佳牛围栏](https://www.acwing.com/problem/content/104/)
+二分平均值 $x$ ，需要存在一个长度大于 $f$ 的区间 $[l,r]$ ，满足 $\frac{s_r-s_{l-1}}{r-(l-1)}\ge x$，即 $s_r-xr\ge s_{l-1}-x(l-1)$。
+设 $c_i=s_i-xi$，不断维护 位置$i-f$ 及其之前的最小值 $c$，小于当前值 $c_i$ 即成立。
+
+坑点：$l\lt true\_val \lt r$，需要 $r$ * 1000下取整，而不是 $l$。
+
+#### [特殊排序](https://www.acwing.com/problem/content/description/115/)
+快排、归并、二分插入都不需要传递性，但比较次数上快排有1.386的常数因子，询问次数过多。
+
+### 0x05 排序
+#### [电影](https://www.acwing.com/problem/content/105/)
+统计每种语言会的人数，逐步比较每部电影即可。
+
+#### [货仓选址](https://www.acwing.com/problem/content/description/106/)
+将第一个和最后一个放一组，第二个和倒数第二个放一组……,对任意一组来说，货仓选在两者之间任意位置都是最优的，考虑所有组，应该选在最中间两个的之间，如果是奇数，就选中间位置。
+
+#### [七夕祭](https://www.acwing.com/problem/content/107/)
+首先行列操作独立，以下分析行操作。
+
+前提是 $t$ 是 $n$ 的倍数。
+
+如果行 $1$ 和行 $n$ 无法交换，转换为均分纸牌问题。
+
+$r_i$ 表示第 $i$ 的感兴趣的摊点数。
+
+考虑前 $i$ 行需要和后面的行交换多少次才能达到最终结果，即 $|s_i-t/n*i|$。
+
+其中 $s_i$ 为 $r_i$ 前缀和，所有前缀的该绝对值求和即为答案。
+
+考虑 $1$ 和 $n$ 可交换的情况，但最优解必定存在两个相邻的不交换，枚举这个断点求最小值即为答案。
+
+设 $rm_i=r_i-t/n$， $s_i$ 为 $rm_i$ 前缀和。
+
+假设断点为 $k$，即最优解为 $|s_{k+1}-s_k|,|s_{k+2}-s_k|……|s_n-s_k|,|s_1+s_n-s_k|……|s_k+s_n-s_k|$
+
+**关键**: $s_n=0$
+
+答案转化为 $\sum\limits_{i=1}^{n}|s_i-s_k|$，转化为货舱选址问题，选择最优位置 $k$，使其他 $s$ 到 $s_k$ 距离之和最小。
+
+```python
+def solve():
+    n,m,t=MIIS()
+    row=[0]*n
+    col=[0]*m
+    for i in range(t):
+        x,y=MIIS()
+        x-=1
+        y-=1
+        row[x]+=1
+        col[y]+=1
+    ans=0
+    p=0
+    out=['impossible','row','column','both']
+    if t%n==0:
+        p+=1
+        for i in range(n):
+            row[i]-=t//n
+            if i:
+                row[i]+=row[i-1]
+        row.sort()
+        for i in range(n):
+            ans+=abs(row[i]-row[n//2])
+    if t%m==0:
+        p+=2
+        for i in range(m):
+            col[i]-=t//m
+            if i:
+                col[i]+=col[i-1]
+        col.sort()
+        for i in range(m):
+            ans+=abs(col[i]-col[m//2])
+    print(out[p],end=' \n'[p==0])
+    if p:
+        print(ans)
+    return
+```
+
+#### [动态中位数](https://www.acwing.com/problem/content/108/)
+对顶堆板子。
+
+大根堆维护前一半，小根堆维护后一半。
+
+小根堆堆顶不存在或者小于小根堆的堆顶就放进大根堆，否则放入小根堆。
+
+时刻维护两个堆的大小。（只可在查询之前维护）
+
+```python
+def solve():
+    ID,m=MIIS()
+    a=[]
+    while len(a)<m:
+        a.extend(LIIS())
+    ans=[]
+    up=[]
+    down=[]
+    for i in range(m):
+        if not down or a[i]<down[0]:
+            heappush(up,-a[i])
+        else:
+            heappush(down,a[i])
+        if i%2==0:
+            while len(up)>(i+2)//2:
+                heappush(down,-heappop(up))
+            while len(down)>i+1-(i+2)//2:
+                heappush(up,-heappop(down))
+            ans.append(-up[0])
+    print(ID,len(ans))
+    c=0
+    for x in ans:
+        c+=1
+        print(x,end=' \n'[c%10==0])
+    if c%10:
+        print()
+    return
+
+test=1
+test=int(input())
+for _ in range(test):
+    solve()
+```
+
+#### [超快速排序](https://www.acwing.com/problem/content/description/109/)
+最优做法就是冒泡排序，交换次数为逆序对数。
+
+可归并排序过程种求逆序数，也可以树状数组动态计数。
+
+```python
+def solve():
+    while True:
+        n=II()
+        if n==0:
+            break
+        a=[]
+        for i in range(n):
+            a.append(II())
+        tmp=[0]*n
+        def calc(l,r):
+            if l>=r:
+                return 0
+            mid=l+r>>1
+            res=calc(l,mid)+calc(mid+1,r)
+            i,j=l,mid+1
+            k=l
+            while i<=mid and j<=r:
+                if a[i]<=a[j]:
+                    tmp[k]=a[i]
+                    i+=1
+                    k+=1
+                else:
+                    res+=mid-i+1
+                    tmp[k]=a[j]
+                    j+=1
+                    k+=1
+            while i<=mid:
+                tmp[k]=a[i]
+                i+=1
+                k+=1
+            while j<=r:
+                tmp[k]=a[j]
+                j+=1
+                k+=1
+            for i in range(l,r+1):
+                a[i]=tmp[i]
+            return res
+        print(calc(0,n-1))
+
+    return
+```
+
+#### [奇数码问题](https://www.acwing.com/problem/content/description/110/)
+两个状态能否到达等价于把除0以外的数排成一列后的逆序数奇偶性是否相等。
+
+$n\times m$数码的有解性判定：若列数为奇数，逆序数奇偶性相等即可；列数为偶数时，逆序数+0的行数差的奇偶性相等有解。
+
+### 0x06 倍增
+给定一个非负整数数列，每次在线询问前缀最大值小于等于查询值 $T$。
+
+两种倍增写法
+
+写法一
+```python
+def solve():
+    n,q=MIIS()
+    a=LIIS()
+    s=list(accumulate(a,initial=0))
+    for i in range(q):
+        k=II()
+        c=0;l=0
+        for j in range(31,-1,-1):
+            r=l+(1<<j)
+            if r<=n and c+s[r]-s[l]<=k:
+                c+=s[r]-s[l]
+                l=r
+        print(c)
+    return
+```
+
+写法二
+```python
+def solve():
+    n,q=MIIS()
+    a=LIIS()
+    s=list(accumulate(a,initial=0))
+    for i in range(q):
+        k=II()
+        c=0;l=0
+        j=1
+        while j:
+            r=l+j
+            if r<=n and c+s[r]-s[l]<=k:
+                c+=s[r]-s[l]
+                l=r
+                j*=2
+            else:
+                j//=2
+        print(c)
+    return
+```
+写法二中的长度 $j$ 一旦开始减少就不会再增加。
+
+#### [天才ACM](https://www.acwing.com/problem/content/description/111/)
+
+每次在当前位置，倍增长度，$check$ 倍增后的区间是否合法（排序后最大最小 $m$ 对数差的平方和 $\le$ $t$）。$O(N(logN)^2)$
+```python
+def solve():
+    n,m,t=MIIS()
+    a=LIIS()
+    def check(l,r):
+        p=list(sorted(a[l:r+1]))
+        res=0
+        for i in range(min(m,len(p)//2)):
+            res+=(p[len(p)-1-i]-p[i])**2
+        return res<=t
+    cnt=0
+    i=0
+    while i<n:
+        length=0
+        j=1
+        while j:
+            r=i+length+j-1
+            if r<n and check(i,r):
+                length+=j
+                j*=2
+            else:
+                j//=2
+        i+=length
+        cnt+=1
+    print(cnt)
+    return
+
+test=1
+test=int(input())
+for _ in range(test):
+    solve()
+```
+
+新增的长度可以和原来的区间归并排序。 $O(NlogN)$
+```python
+def solve():
+    n,m,t=MIIS()
+    a=LIIS()
+    cnt=0
+    i=0
+    while i<n:
+        length=0
+        j=1
+        L=[]
+        while j:
+            r=i+length+j-1
+            if r>=n:
+                j//=2
+                continue
+            R=sorted(a[i+length:r+1])
+            M=sorted(L+R)
+            res=0
+            for k in range(min(m,len(M)//2)):
+                res+=(M[len(M)-1-k]-M[k])**2
+            if res<=t:
+                length+=j
+                L=M
+                j*=2
+            else:
+                j//=2
+        i+=length
+        cnt+=1
+    print(cnt)
+    return
+
+test=1
+test=int(input())
+for _ in range(test):
+    solve()
+```
+
+**tips:** $python$ 的 $Timsort$ 会检测有序数组并归并排序，比手写快。
+
+### 0x07 贪心
+#### [股票买卖 II](https://www.acwing.com/problem/content/1057/)
+获取每个上涨区间的收益
+```python
+def solve():
+    n=II()
+    a=LIIS()
+    s=0
+    for i in range(1,n):
+        s+=max(0,a[i]-a[i-1])
+    print(s)
+    return
+```
+
+#### [防晒](https://www.acwing.com/problem/content/description/112/)
+按左端点降序排序，选取在该区间内最大的点。
+对于任意处于该区间的两个点，较小的点更可能处于后面的区间，所以当前区间尽量使用较大点。
+```python
+def solve():
+    c,L=MIIS()
+    SPF=[]
+    for i in range(c):
+        l,r=MIIS()
+        SPF.append([l,r])
+    SPF.sort(key=lambda x:x[0],reverse=True)
+    cover=[]
+    for i in range(L):
+        s,cv=MIIS()
+        cover.append([s,cv])
+    cover.sort()
+    ans=0
+    for l,r in SPF:
+        for j in range(L-1,-1,-1):
+            if l<=cover[j][0]<=r and cover[j][1]:
+                cover[j][1]-=1
+                ans+=1
+                break
+    print(ans)
+    return
+```
+
+#### [畜栏预定](https://www.acwing.com/problem/content/description/113/)
+按左端点排序，对于当前区间，找到一个之前的区间右端点小于当前区间的左端点就塞进去，否则新建一个。
+
+**确实不会证明正确性**
+```python
+def solve():
+    n=II()
+    segs=[]
+    for i in range(n):
+        l,r=MIIS()
+        segs.append([l,r,i])
+    segs.sort(key=lambda x:x[0])
+    ans=[0]*n
+    q=[]
+    for l,r,i in segs:
+        if q and q[0][0]<l:
+            ans[i]=heappop(q)[1]
+            heappush(q,[r,ans[i]])
+        else:
+            ans[i]=len(q)+1
+            heappush(q,[r,ans[i]])
+    print(len(q))
+    for i in range(n):
+        print(ans[i])
+    return
+```
+
+#### [雷达设备](https://www.acwing.com/problem/content/description/114/)
+找出能检测到每个坐标的区间，转化成区间选点问题。
+
+按左端点排序，维护最后一个雷达的位置 $lst$，如果当前区间左端点在 $lst$ 右边，则新加一个点，否则使用当前雷达检测该点，并更新 $lst=min(lst,r)$。
+
+```python
+def solve():
+    n,d=MIIS()
+    segs=[]
+    ok=True
+    for i in range(n):
+        x,y=MIIS()
+        if y>d:
+            ok=False
+        else:
+            z=sqrt(d*d-y*y)
+            segs.append([x-z,x+z])
+    if not ok:
+        print(-1)
+        return
+    segs.sort()
+    lst=-inf
+    ans=0
+    for l,r in segs:
+        if l>lst:
+            ans+=1
+            lst=r
+        else:
+            lst=fmin(lst,r)
+    print(ans)
+
+    return
+```
+
+#### [国王游戏](https://www.acwing.com/problem/content/description/116/)
+考虑领项交换。
+
+对于任意一种顺序，考虑将第 $i$ 项和第 $i+1$ 项交换后的结果。
+
+记前 $i-1$ 项左手乘积为 $L$，若未交换前的顺序为最有优，则有
+$$
+\max(\frac{L}{r_i},\frac{L\times l_i}{r_{i+1}})\le \max(\frac{L}{r_{i+1}},\frac{L\times l_{i+1}}{r_{i}})
+$$
+
+化简得到
+$$
+\max(r_{i+1},l_i\times r_i)\le \max(r_{i},l_{i+1}\times r_{i+1})
+$$
+
+可按此顺序排序
+
+```python
+def solve():
+    n=II()
+    L,R=MIIS()
+    a=[]
+    for i in range(n):
+        l,r=MIIS()
+        a.append([l,r])
+    def cmp(x,y):
+        X=max(y[1],x[0]*x[1])
+        Y=max(x[1],y[0]*y[1])
+        return X-Y
+    a.sort(key=cmp_to_key(cmp))
+    ans=0
+    for l,r in a:
+        ans=max(ans,L//r)
+        L*=l
+    print(ans)
+
+    return
+```
+
+当然也可以继续化简
+
+考虑 $l_i\times r_i$ 和 $r_{i+1}\times l_{i+1}$ 的大小关系，发现只有 $l_i\times r_i \le l_{i+1}\times r_{i+1}$ 满足要求。
+
+```python
+def solve():
+    n=II()
+    L,R=MIIS()
+    a=[]
+    for i in range(n):
+        l,r=MIIS()
+        a.append([l,r])
+    a.sort(key=lambda x:x[0]*x[1])
+    ans=0
+    for l,r in a:
+        ans=max(ans,L//r)
+        L*=l
+    print(ans)
+
+    return
+```
+
+#### [给树染色](https://www.acwing.com/problem/content/117/)
+如果没有任何限制，应该是从最大值开始染。
+
+考虑父节点必须先染色的限制，每次找到最大非根节点，它必须在其父节点染色后立即染色，这两个点的染色是连续的。
+
+可以考虑将这两个点合并。
+
+如 $y$ 的父节点是 $x$， 合并后与节点 $z$之间的染色顺序。
+
+如果 $x,y$ 先染色更优，则有
+
+$$
+\begin{aligned}
+tx+(t+1)y+(t+2)z
+&\le tz+(t+1)x+(t+2)y,\\
+2z&\le x+y,\\
+z&\le \frac{x+y}{2}.
+\end{aligned}
+$$
+
+合并后的节点的权值为合并前所有节点的平均值（可尝试更多节点合并的结果进行验证）
+
+做法：每次找到最大非根节点，将其合并到父节点。
+
+技巧：并不一定真的要将节点合并，可以考虑合并对答案的增量，如将 $y$ 合并到 $x$，$y$ 对答案的贡献增加了 $size(x)\times \sum\limits_{i\in y}a_i$。
+
+所以在合并的时候持续维护每个节点内的节点数量，权值之和，平均值。
+
+```python
+class Node:
+    def __init__(self,fa,siz,sum,avg):
+        self.fa=fa
+        self.siz=siz
+        self.sum=sum
+        self.avg=avg
+
+def solve():
+    n,r=MIIS()
+    r-=1
+    a=LIIS()
+    nodes=[Node(None,1,a[i],a[i]) for i in range(n)]
+    ans=sum(a)
+    for i in range(n-1):
+        u,v=MIIS()
+        u-=1
+        v-=1
+        nodes[v].fa=u
+    for i in range(n-1):
+        p=-1
+        for j in range(n):
+            if j!=r and (p==-1 or nodes[j].avg>nodes[p].avg):
+                p=j
+        fa=nodes[p].fa
+        while nodes[fa].avg==0:
+            fa=nodes[fa].fa
+        siz=nodes[p].siz
+        s=nodes[p].sum
+        ans+=nodes[fa].siz*s
+        nodes[p].avg=0
+        nodes[fa].siz+=siz
+        nodes[fa].sum+=s
+        nodes[fa].avg=nodes[fa].sum/nodes[fa].siz
+    print(ans)
+
+    return
+```
+
+### 0x08 总结与练习
+#### [飞行员兄弟](https://www.acwing.com/problem/content/description/118/)
+位运算枚举状态
+```python
+def solve():
+    a=[]
+    for i in range(4):
+        a.append(LI())
+    def check(ls):
+        s=deepcopy(a)
+        def change(i,j):
+            for k in range(4):
+                s[i][k]='+' if s[i][k]!='+' else '-'
+                s[k][j]='+' if s[k][j]!='+' else '-'
+            s[i][j]='+' if s[i][j]!='+' else '-'
+        for i in range(4):
+            for j in range(4):
+                if (ls[i]>>j)&1:
+                    change(i,j)
+        for i in range(4):
+            for j in range(4):
+                if s[i][j]!='-':
+                    return False
+        return True
+    ans=inf
+    res=[]
+    for i in range(1<<4):
+        for j in range(1<<4):
+            for k in range(1<<4):
+                for l in range(1<<4):
+                    if check([i,j,k,l]):
+                        cnt=i.bit_count()+j.bit_count()+k.bit_count()+l.bit_count()
+                        if cnt<ans:
+                            ans=cnt
+                            res=[i,j,k,l]
+    print(ans)
+    for i in range(4):
+        for j in range(4):
+            if (res[i]>>j)&1:
+                print(i+1,j+1)
+
+    return
+```
+
+#### [占卜DIY](https://www.acwing.com/problem/content/119/)
+队列模拟即可
+```python
+def solve():
+    q=[deque() for i in range(13)]
+    def M(x):
+        if x=='0':
+            return 9
+        if x.isdigit():
+            return int(x)-1
+        if x=='A':
+            return 0
+        if x=='J':
+            return 10
+        if x=='Q':
+            return 11
+        if x=='K':
+            return 12
+    for i in range(13):
+        s=IS()
+        for x in s:
+            q[i].append([M(x),'d'])
+    for i in range(4):
+        x,s=q[12].popleft()
+        while x!=12:
+            q[x].appendleft([x,'u'])
+            x,s=q[x].pop()
+    cnt=defaultdict(int)
+    for i in range(13):
+        while q[i] and q[i][0]==[i,'u']:
+            cnt[q[i].popleft()[0]]+=1
+    ans=0
+    for j in cnt.values():
+        if j==4:
+            ans+=1
+    print(ans)
+    return
+```
+
+#### [分形](https://www.acwing.com/problem/content/description/120/)
+递归处理即可
+```python
+def solve():
+    while True:
+        n=II()
+        if n==-1:
+            break
+        N=3**(n-1)
+        ans=[[' ']*N for i in range(N)]
+        def paint(n,r1,c1,N):
+            if N==1:
+                ans[r1][c1]='X'
+                return
+            m=N//3
+            paint(n-1,r1,c1,m)
+            paint(n-1,r1,c1+2*m,m)
+            paint(n-1,r1+2*m,c1,m)
+            paint(n-1,r1+2*m,c1+2*m,m)
+            paint(n-1,r1+m,c1+m,m)
+            return
+        paint(n,0,0,N)
+        for i in range(N):
+            print(''.join(ans[i]))
+        print('-')
+    return
+```
+
+#### [袭击](https://www.acwing.com/problem/content/121/)
+[经典平面最近点对问题](https://www.luogu.com.cn/problem/P7883)
+
+不同的是只对不同阵营的点计算距离，如果使用分治方法，在两个阵营的点完全被分割在左右两侧时，复杂度可达 $O(N^2)$。
+
+但这题的数据并没有那么的毒瘤，在排序前 random_shuffle 所有点使不同阵营的点混合即可通过。
+
+其他处理方法：所有点随机旋转一个角度（[纯旋转仍有可能被卡，可在排序后先用坐标相近的异色点更新最小距离](https://www.acwing.com/problem/content/submission/code_detail/44034750/)）、KD-tree
+
+```cpp
+// #pragma GCC optimize(3,"Ofast","inline")
+#include <bits/stdc++.h>
+
+using namespace std;
+using i64=long long;
+using u32=unsigned;
+using u64=unsigned long long;
+
+using i128=__int128;
+using u128=unsigned __int128;
+
+constexpr int inf=numeric_limits<int>::max()/2;
+constexpr i64 INF=numeric_limits<i64>::max()/2;
+
+template<class T>
+struct Point{
+    T x,y;
+    int idx;
+    Point(const T &x_=0,const T &y_=0,const T &idx_=0):x(x_),y(y_),idx(idx_){}
+    friend istream &operator>>(istream &is,Point &p){
+        return is>>p.x>>p.y;
+    }
+    friend ostream &operator<<(ostream &os,const Point &p){
+        return os<<"("<<p.x<<","<<p.y<<")";
+    }
+};
+
+const int N=200000;
+using T=int;
+using P=Point<T>;
+P ps[N+1];
+
+i64 min_dist_square=INF;
+P ans_p1,ans_p2;
+
+void update_ans(const P& a, const P& b) {
+    i64 dist=(i64)(a.x-b.x)*(a.x-b.x)+(i64)(a.y-b.y)*(a.y-b.y);
+    if(dist<min_dist_square){
+        min_dist_square=dist;
+        ans_p1=a,ans_p2=b;
+    }
+}
+
+void get_minh(int l,int r){
+    if(l+1==r){
+        return;
+    }
+    int mid=l+r>>1;
+    T midx=ps[mid].x;
+    get_minh(l,mid),get_minh(mid,r);
+    inplace_merge(ps+l,ps+mid,ps+r,[&](auto a,auto b){
+        return a.y<b.y;
+    });
+
+    vector<P> t;
+    for(int i=l;i<r;i++){
+        if((i64)(ps[i].x-midx)*(ps[i].x-midx)<min_dist_square){
+            t.push_back(ps[i]);
+        }
+    }
+    for(int i=0;i<t.size();i++){
+        for(int j=i+1;j<t.size();j++){
+            if((i64)(t[i].y-t[j].y)*(t[i].y-t[j].y)>=min_dist_square)
+                break;
+            if(t[i].idx!=t[j].idx){
+                update_ans(t[i],t[j]);
+            }
+        }
+    }
+
+}
+
+void solve(){
+    int n;
+    cin>>n;
+    for(int i=0;i<n;i++){
+        cin>>ps[i].x>>ps[i].y;
+        ps[i].idx=0;
+    }
+    for(int i=0;i<n;i++){
+        cin>>ps[i+n].x>>ps[i+n].y;
+        ps[i+n].idx=1;
+    }
+    random_shuffle(ps,ps+2*n);
+    min_dist_square=INF;
+
+    sort(ps,ps+2*n,[&](auto a,auto b){
+        return a.x<b.x;
+    });
+    get_minh(0,2*n);
+    cout<<fixed<<setprecision(3);
+    cout<<sqrt(min_dist_square)<<"\n";
+}
+
+int main(){
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    int test=1;
+    cin>>test;
+    while(test--){
+        solve();
+    }
+
+    return 0;
+}
+```
+
+#### [防线](https://www.acwing.com/problem/content/description/122/)
+破绽点及之后的点，对防具数做前缀和是奇数，之前的点是偶数，存在二段性，考虑二分。
+
+```python
+def solve():
+    n=II()
+    s=[0]*n
+    e=[0]*n
+    d=[0]*n
+    for i in range(n):
+        s[i],e[i],d[i]=MIIS()
+    def check(x):
+        cnt=0
+        for i in range(n):
+            if s[i]>x:
+                continue
+            cnt+=(fmin(e[i],x)-s[i])//d[i]+1
+        return cnt%2
+    l,r=0,1<<32
+    while l<r:
+        mid=l+r>>1
+        if check(mid):
+            r=mid
+        else:
+            l=mid+1
+    if check(r):
+        res=0
+        for i in range(n):
+            if s[i]<=r<=e[i]:
+                res+=int((r-s[i])%d[i]==0)
+        print(r,res)
+    else:
+        print('There\'s no weakness.')
+    return
+
+test=1
+test=int(input())
+for _ in range(test):
+    solve()
+```
+
+#### [赶牛入圈](https://www.acwing.com/problem/content/description/123/)
+横坐标、纵坐标分别离散化，二分答案边长，枚举正方形左上方点，根据左上方点和边长二分到右下方点，统计数量（二维前缀和预处理）。
+
+$O(N^2logNlogM)$，M 为最大边长
+
+```python
+def solve():
+    c,n=MIIS()
+    nums_x=[]
+    nums_y=[]
+    pos=[]
+    for i in range(n):
+        x,y=MIIS()
+        pos.append([x,y])
+        nums_x.append(x)
+        nums_y.append(y)
+    nums_x=list(set(nums_x))
+    nums_x.sort()
+    nums_y=list(set(nums_y))
+    nums_y.sort()
+    @cache
+    def find(x,type):
+        if type=='x':
+            return bisect_left(nums_x,x)
+        else:
+            return bisect_left(nums_y,x)
+    g=[[0]*len(nums_y) for i in range(len(nums_x))]
+    for x,y in pos:
+        x=find(x,'x')
+        y=find(y,'y')
+        g[x][y]+=1
+    for i in range(len(nums_x)):
+        for j in range(len(nums_y)):
+            if i:
+                g[i][j]+=g[i-1][j]
+            if j:
+                g[i][j]+=g[i][j-1]
+            if i and j:
+                g[i][j]-=g[i-1][j-1]
+    def count(r1,c1,r2,c2):
+        res=g[r2][c2]
+        if r1:
+            res-=g[r1-1][c2]
+        if c1:
+            res-=g[r2][c1-1]
+        if r1 and c1:
+            res+=g[r1-1][c1-1]
+        return res
+    def check(d):
+        for i in range(len(nums_x)):
+            r1=i
+            r2=bisect(nums_x,nums_x[r1]-1+d)-1
+            for j in range(len(nums_y)):
+                c1=j
+                c2=bisect(nums_y,nums_y[c1]-1+d)-1
+                cnt=count(r1,c1,r2,c2)
+                if cnt>=c:
+                    return True
+        return False
+    l,r=1,fmax(nums_x[-1],nums_y[-1])
+    while l<r:
+        mid=l+r>>1
+        if check(mid):
+            r=mid
+        else:
+            l=mid+1
+    print(r)
+    return
+```
+
+#### [糖果传递](https://www.acwing.com/problem/content/description/124/)
+环形均分纸牌问题，参考七夕祭。
+
+```python
+def solve():
+    n=II()
+    a=[]
+    for i in range(n):
+        a.append(II())
+    s=sum(a)
+    avg=s//n
+    b=[x-avg for x in a]
+    preb=list(accumulate(b))
+    preb.sort()
+    ans=0
+    for i in range(n):
+        ans+=abs(preb[i]-preb[n//2])
+    print(ans)
+    return
+```
+
+
+#### [士兵](https://www.acwing.com/problem/content/125/)
+横纵坐标贡献分离，纵坐标转化为找一个点到所有点距离和最小。
+
+考虑横坐标 $x_0,x_1,x_2……,x_{n-1}\rightarrow a_0,a_0+1,a_0+2,……,a_0+n-1$
+
+最小化 $\sum\limits|x_i-(a_0+i)|=\sum\limits|(x_i-i)-a_0|$
+
+转化为找一个点 $a_0$ 使得 所有 $x_i-i$ 到该点距离和最小。
+
+```python
+def solve():
+    n=II()
+    x=[0]*n
+    y=[0]*n
+    for i in range(n):
+        x[i],y[i]=MIIS()
+    y.sort()
+    ans=0
+    for i in range(n):
+        ans+=abs(y[i]-y[n//2])
+    x.sort()
+    x=[x[i]-i for i in range(n)]
+    x.sort()
+    for i in range(n):
+        ans+=abs(x[i]-x[n//2])
+    print(ans)
+
+    return
+```
+
+#### [数的进制转换](https://www.acwing.com/problem/content/description/126/)
+进制转换,注意0的转换
+```python
+def solve():
+    ni,no,s=IS()
+    ni=int(ni)
+    no=int(no)
+    def get(x):
+        if x.isdigit():
+            return int(x)
+        if 'A'<=x<='Z':
+            return ord(x)-ord('A')+10
+        return ord(x)-ord('a')+36
+    num=0
+    for x in s:
+        num=num*ni+get(x)
+    def f(n):
+        if n<10:
+            return str(n)
+        if n<=35:
+            return chr(ord('A')+n-10)
+        return chr(ord('a')+n-36)
+    res=[]
+    while num:
+        num,rem=divmod(num,no)
+        res.append(f(rem))
+    print(ni,s)
+    if res:
+        print(no,''.join(res[::-1]))
+    else:
+        print(no,0)
+    print()
+
+
+    return
+
+
+test=1
+test=int(input())
+for _ in range(test):
+    solve()
+```
+
+#### [耍杂技的牛](https://www.acwing.com/problem/content/description/127/)
+领项交换
+```python
+def solve():
+    n=II()
+    a=[]
+    for i in range(n):
+        w,s=MIIS()
+        a.append([w,s])
+    def cmp(x,y):
+        return fmax(x[0]+x[1],y[1])-fmax(y[0]+y[1],x[1])
+    a.sort(key=cmp_to_key(cmp))
+    ans=-inf
+    S=0
+    for w,s in a:
+        ans=fmax(ans,S-s)
+        S+=w
+    print(ans)
+    return
+```
+
+#### [最大的和](https://www.acwing.com/problem/content/description/128/)
+解法1：暴力枚举左上方和右下方点，用前缀和 $O(1)$ 得到矩阵和， $O(N^4)$。
+
+解法2：枚举上下边界，转化成最大子段和，$O(N^3)$。
+
+#### [任务](https://www.acwing.com/problem/content/129/)
+y的贡献最大只有200，x至少有500，优先考虑x。
+
+对任务和机器都按 x 从大到小排序，再按 y 从大到小排序。
+
+对于每个任务，在 满足 x 条件的机器里，挑出满足 y 条件的 y 最小机器。
+
+因为对于后面的任务，当前选出的机器 x 都满足条件，但 y 较大者尽量留给后面。
+
+```cpp
+// #pragma GCC optimize(3,"Ofast","inline")
+#include <bits/stdc++.h>
+
+using namespace std;
+using i64=long long;
+using u32=unsigned;
+using u64=unsigned long long;
+
+using i128=__int128;
+using u128=unsigned __int128;
+
+// mt19937 rng(chrono::steady_clock::now().time_since_epoch().count());
+
+constexpr int inf=numeric_limits<int>::max()/2;
+constexpr i64 INF=numeric_limits<i64>::max()/2;
+
+void solve(){
+    int n,m;
+    cin>>n>>m;
+
+    vector<array<int,2>> machine(n),task(m);
+    for(int i=0;i<n;i++){
+        cin>>machine[i][0]>>machine[i][1];
+    }
+    for(int i=0;i<m;i++){
+        cin>>task[i][0]>>task[i][1];
+    }
+
+    sort(task.begin(),task.end());
+    reverse(task.begin(),task.end());
+    sort(machine.begin(),machine.end());
+    reverse(machine.begin(),machine.end());
+
+    multiset<int> s;
+    int cnt=0,j=0;
+    i64 ans=0;
+    for(auto [x,y]:task){
+        while(j<n&&machine[j][0]>=x){
+            auto [xj,yj]=machine[j++];
+            s.insert(yj);
+        }
+        auto it=s.lower_bound(y);
+        if(it!=s.end()){
+            ans+=500*x+2*y;
+            cnt++;
+            s.erase(it);
+        }
+    }
+
+    cout<<cnt<<" "<<ans<<"\n";
+
+}
+
+int main(){
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    int test=1;
+    // cin>>test;
+    while(test--){
+        solve();
+    }
+
+    return 0;
+}
+```
+
+## 0x10 基本数据结构
+### 0x11 栈
+#### [包含min函数的栈](https://www.acwing.com/problem/content/description/90/)
+栈和数组没区别啊，就是维护个前缀最小值。
+```python
+class MinStack(object):
+
+    def __init__(self):
+        """
+        initialize your data structure here.
+        """
+        self.q=[]
+
+
+    def push(self, x):
+        """
+        :type x: int
+        :rtype: void
+        """
+        if self.q:
+            self.q.append([x,min(self.q[-1][1],x)])
+        else:
+            self.q.append([x,x])
+
+
+    def pop(self):
+        """
+        :rtype: void
+        """
+        self.q.pop()
+
+
+    def top(self):
+        """
+        :rtype: int
+        """
+        return self.q[-1][0]
+
+
+    def getMin(self):
+        """
+        :rtype: int
+        """
+        return self.q[-1][1]
+
+
+
+# Your MinStack object will be instantiated and called as such:
+# obj = MinStack()
+# obj.push(x)
+# obj.pop()
+# param_3 = obj.top()
+# param_4 = obj.getMin()
+```
+
+#### [编辑器](https://www.acwing.com/problem/content/description/130/)
+两个栈一个维护光标前，一个维护光标后。光标前的维护前缀和和前缀和最大值。
+```python
+def solve():
+    n=II()
+    l=[]
+    r=[]
+    for i in range(n):
+        s=IS()
+        if s[0]=='I':
+            x=int(s[1])
+            if l:
+                l.append([x,x+l[-1][1],fmax(x+l[-1][1],l[-1][2])])
+            else:
+                l.append([x,x,x])
+        elif s[0]=='D':
+            if l:
+                l.pop()
+        elif s[0]=='L':
+            if l:
+                r.append(l.pop()[0])
+        elif s[0]=='R':
+            if r:
+                x=r.pop()
+                if l:
+                    l.append([x,l[-1][1]+x,fmax(l[-1][1]+x,l[-1][2])])
+                else:
+                    l.append([x,x,x])
+        else:
+            k=int(s[1])
+            if l:
+                print(l[k-1][2])
+
+    return
+```
+#### [火车进栈](https://www.acwing.com/problem/content/131/)
+对于每个状态存在两种选择：新元素入栈/栈内最后一个元素出栈
+```py
+def solve():
+    n=II()
+    ans=[]
+    def f(ins,outs,nxt):
+        if not ins and len(outs)==n:
+            ans.append(outs.copy())
+            return
+        if nxt<=n:
+            ins.append(nxt)
+            f(ins,outs,nxt+1)
+            ins.pop()
+        if ins:
+            outs.append(ins.pop())
+            f(ins,outs,nxt)
+            ins.append(outs.pop())
+        return
+    f([],[],1)
+    ans.sort()
+    for i in range(min(20,len(ans))):
+        print(''.join(map(str,ans[i])))
+    return
+```
+
+#### 后缀表达式求值
+```python
+def calc(a,b,op):
+    if op=='+':
+        return a+b
+    if op=='-':
+        return a-b
+    if op=='*':
+        return a*b
+    if op=='/':
+        return a/b
+def split(s):
+    split_s=[]
+    num=[]
+    for x in s:
+        if x.isdigit():
+            num.append(x)
+        else:
+            if num:
+                split_s.append(''.join(num))
+                num=[]
+            split_s.append(x)
+    if num:
+        split_s.append(''.join(num))
+    return split_s
+def suffix_expression_value(s):
+    split_s=split(s)
+    # split_s is a list expression has been splited into digit and operator
+    stk=[]
+    for x in split_s:
+        if x.isdigit():
+            stk.append(int(x))
+        else:
+            a,b=stk.pop(),stk.pop()
+            c=calc(a,b,x)
+            stk.append(c)
+    return stk[0]
+```
+
+#### 中缀表达式转后缀表达式
+```python
+def split(s):
+    split_s=[]
+    num=[]
+    for x in s:
+        if x.isdigit():
+            num.append(x)
+        else:
+            if num:
+                split_s.append(''.join(num))
+                num=[]
+            split_s.append(x)
+    if num:
+        split_s.append(''.join(num))
+    return split_s
+def priority(op):
+    if op=='*' or op=='/':
+        return 2
+    if op=='+' or op=='-':
+        return 1
+    return 0
+def infix_to_suffix(s):
+    split_s=split(s)
+    exp=[]
+    oper=[]
+    for x in split_s:
+        if x.isdigit():
+            exp.append(x)
+        elif x=='(':
+            oper.append(x)
+        elif x==')':
+            while oper[-1]!='(':
+                exp.append(oper.pop())
+            oper.pop()
+        else:
+            while oper and oper[-1]!='(' and priority(x)<=priority(oper[-1]):
+                exp.append(oper.pop())
+            oper.append(x)
+    while oper:
+        exp.append(oper.pop())
+    print(''.join(exp))
+```
+
+#### [直方图中最大的矩形](https://www.acwing.com/problem/content/133/)
+考虑单调递增的的情况，对于每个矩形，从它开始，到最右边的宽之和，乘它的高，取 max，即为答案。
+维护单调栈，每次弹出的时候，维护宽度和，每个弹出的元素高度乘它和后边弹出的元素宽度和，去更新答案，弹出元素的宽度和加到入站的新元素的宽度上。
+注意：最后栈里还有元素，需要再计算一次；当然也可以放一个最小的值到最后，轮到它的时候前面元素都会弹出以更新答案。
+```python
+def solve():
+    while True:
+        h=LIIS()
+        if h==[0]:
+            break
+        h.append(0)
+        ans=0
+        stk=[]
+        w=[]
+        for i,x in enumerate(h[1:]):
+            width=0
+            while stk and stk[-1]>=x:
+                width+=w.pop()
+                s=stk.pop()
+                ans=fmax(ans,s*width)
+            width+=1
+            stk.append(x)
+            w.append(width)
+        print(ans)
+    return
+```
+
+#### [小组队列](https://www.acwing.com/problem/content/134/)
+每个队伍维护一个队列，同时维护一个在队内的队伍编号的队列
+```python
+def solve():
+    c=0
+    while True:
+        t=II()
+        c+=1
+        if t==0:
+            break
+        idx={}
+        for i in range(t):
+            n,*m=LIIS()
+            for j in range(n):
+                idx[m[j]]=i
+        Q=deque()
+        q=[deque() for i in range(n)]
+        print(f'Scenario #{c}')
+        while True:
+            s=IS()
+            if s[0]=='STOP':
+                break
+            if s[0]=='ENQUEUE':
+                x=int(s[1])
+                i=idx[x]
+                if not q[i]:
+                    Q.append(i)
+                q[i].append(x)
+            elif Q:
+                i=Q[0]
+                print(q[i].popleft())
+                if not q[i]:
+                    Q.popleft()
+        print()
+    return
+```
+
+#### [蚯蚓](https://www.acwing.com/problem/content/135/)
+直接小根堆会超时，维护三个队列，每次取出队头中最大的，分成的两段分别放到第二和第三个队列末尾，维护的队列是单调递减的
+```python
+def solve():
+    n,m,q,u,v,t=MIIS()
+    a=LIIS()
+    a.sort(reverse=True)
+    q0=deque(a)
+    q1=deque()
+    q2=deque()
+    add=0
+    ans=[]
+    for i in range(1,m+1):
+        x0=q0[0] if q0 else -inf
+        x1=q1[0] if q1 else -inf
+        x2=q2[0] if q2 else -inf
+        if x0>=x1 and x0>=x2:
+            x=q0.popleft()
+        elif x1>=x2:
+            x=q1.popleft()
+        else:
+            x=q2.popleft()
+        x+=add
+        l=u*x//v
+        r=x-l
+        add+=q
+        l-=add
+        r-=add
+        q1.append(l)
+        q2.append(r)
+        if i%t==0:
+            ans.append(str(x)+' ')
+    ans.append('\n')
+    for i in range(n+m):
+        x0=q0[0] if q0 else -inf
+        x1=q1[0] if q1 else -inf
+        x2=q2[0] if q2 else -inf
+        if x0>=x1 and x0>=x2:
+            x=q0.popleft()
+        elif x1>=x2:
+            x=q1.popleft()
+        else:
+            x=q2.popleft()
+        if (i+1)%t==0:
+            ans.append(str(x+add)+' ')
+    write(''.join(ans))
+    return
+```

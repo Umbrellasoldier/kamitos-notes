@@ -1,0 +1,139 @@
+---
+title: "用交换论证推导贪心排序规则"
+description: "从相邻元素交换出发，推导国王游戏与耍杂技的牛两道题中的排序依据。"
+publishedAt: "2023-11-16"
+updatedAt: "2026-08-13"
+category: "技术"
+tags:
+  - "算法竞赛"
+  - "贪心"
+  - "排序"
+  - "证明"
+featured: false
+draft: false
+---
+
+许多贪心题的难点不在实现，而在于回答一个问题：**为什么必须按这个顺序排序？**
+
+交换论证提供了一条很实用的思路。只观察相邻的两个元素，比较交换前后的目标值；如果每一个“逆序对”都能在不让答案变差的前提下被交换，那么不断消除逆序对，最终就能得到全局最优的排序规则。
+
+## 通用推导步骤
+
+设相邻元素为 $A$ 和 $B$，它们之前已经累积的状态为 $P$。
+
+1. 写出顺序 $A,B$ 对目标函数的贡献 $F(A,B)$。
+2. 写出交换后的贡献 $F(B,A)$。
+3. 化简不等式 $F(A,B)\le F(B,A)$，得到 $A$ 应排在 $B$ 前面的条件。
+4. 检查这个比较关系是否具有一致性，再把它实现为排序关键字。
+
+下面用两道经典题说明这个过程。
+
+## 例一：国王游戏
+
+[题目链接](https://www.acwing.com/problem/content/description/116/)
+
+第 $i$ 位大臣左右手的数字分别为 $l_i,r_i$。设排在这两位大臣之前的左手数字之积为 $P$，当前相邻的大臣为 $i,j$。
+
+按 $i,j$ 排列时，这两人的奖赏最大值为
+
+$$
+M_{ij}
+=
+P\max\left(\frac{1}{r_i},\frac{l_i}{r_j}\right).
+$$
+
+交换为 $j,i$ 后，最大值变为
+
+$$
+M_{ji}
+=
+P\max\left(\frac{1}{r_j},\frac{l_j}{r_i}\right).
+$$
+
+因为 $P,r_i,r_j$ 都为正数，将两边同时乘以 $r_ir_j/P$，只需比较
+
+$$
+\max(r_j,l_ir_i)
+\quad\text{与}\quad
+\max(r_i,l_jr_j).
+$$
+
+若 $l_ir_i\le l_jr_j$，又因为左手数字不小于 $1$，则
+
+$$
+\max(r_j,l_ir_i)\le l_jr_j
+=
+\max(r_i,l_jr_j).
+$$
+
+因此把 $l_ir_i$ 较小的大臣放在前面不会使答案变差，排序规则就是按 $l_ir_i$ 从小到大排列。
+
+```python
+n = int(input())
+people = [tuple(map(int, input().split())) for _ in range(n + 1)]
+
+king = people[0]
+ministers = sorted(people[1:], key=lambda person: person[0] * person[1])
+
+answer = 0
+left_product = king[0]
+
+for left, right in ministers:
+    answer = max(answer, left_product // right)
+    left_product *= left
+
+print(answer)
+```
+
+## 例二：耍杂技的牛
+
+[题目链接](https://www.acwing.com/problem/content/127/)
+
+第 $i$ 头牛的体重和强壮程度分别为 $w_i,s_i$。一头牛的风险值等于它上方所有牛的总重量减去自己的强壮程度。
+
+设相邻两头牛之前的总重量为 $P$。按 $i,j$ 排列时，两者风险的最大值为
+
+$$
+R_{ij}
+=
+P+\max(-s_i,w_i-s_j).
+$$
+
+交换后的最大值为
+
+$$
+R_{ji}
+=
+P+\max(-s_j,w_j-s_i).
+$$
+
+如果 $w_i+s_i\le w_j+s_j$，那么
+
+$$
+w_i-s_j\le w_j-s_i.
+$$
+
+同时，由于 $w_j\ge 0$，有 $-s_i\le w_j-s_i$。因此 $R_{ij}$ 中的两个候选值都不大于 $R_{ji}$ 的第二个候选值，得到 $R_{ij}\le R_{ji}$。
+
+所以本题应按 $w_i+s_i$ 从小到大排序。
+
+```python
+n = int(input())
+cows = [tuple(map(int, input().split())) for _ in range(n)]
+cows.sort(key=lambda cow: cow[0] + cow[1])
+
+answer = -float("inf")
+weight_above = 0
+
+for weight, strength in cows:
+    answer = max(answer, weight_above - strength)
+    weight_above += weight
+
+print(answer)
+```
+
+## 小结
+
+交换论证把“猜一个排序规则”变成了“比较相邻两项”。它尤其适合目标值由前缀状态和当前元素共同决定的题目。
+
+使用时仍要注意两点：局部交换必须只影响可控范围；由不等式得到的比较关系也必须能形成一致的全序。满足这两个条件后，排序实现往往只是最后、也是最简单的一步。

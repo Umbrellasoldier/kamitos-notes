@@ -36,7 +36,7 @@ export function ThemeToggle() {
       current === "light" || current === "dark" || current === "system"
         ? current
         : "system";
-    setPreference(initial);
+    const frame = window.requestAnimationFrame(() => setPreference(initial));
 
     const media = window.matchMedia("(prefers-color-scheme: dark)");
     const onChange = () => {
@@ -45,7 +45,10 @@ export function ThemeToggle() {
       }
     };
     media.addEventListener("change", onChange);
-    return () => media.removeEventListener("change", onChange);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      media.removeEventListener("change", onChange);
+    };
   }, []);
 
   const currentIndex = choices.findIndex((choice) => choice.value === preference);
