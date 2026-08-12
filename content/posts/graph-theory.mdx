@@ -1,0 +1,593 @@
+---
+title: "图论基础：从最短路到最近公共祖先"
+description: "面向算法竞赛的图论复习笔记，系统整理图的存储、拓扑排序、最短路、最小生成树、差分约束与最近公共祖先。"
+publishedAt: "2023-11-16"
+updatedAt: "2026-08-13"
+category: "技术"
+tags:
+  - "算法竞赛"
+  - "图论"
+  - "最短路"
+  - "树"
+featured: false
+draft: false
+---
+
+这篇笔记以竞赛中最常见的图论模型为主线，依次整理存储方式、遍历框架与典型算法。代码以可复用模板为主，适合已经了解基本概念后查漏补缺。
+
+> 阅读时可以先根据目录定位问题类型，再结合适用条件、复杂度和模板代码进行复习。
+
+## 树与图的存储
+![使用数组模拟邻接表的结构示意图](/posts/graph-theory/graph-storage-1.png)
+![邻接表中节点与边的连接关系](/posts/graph-theory/graph-storage-2.png)
+#### 邻接矩阵
+```python
+g=[[float('inf')]*N for i in range(N)]
+for i in range(1,n+1):
+    g[i][i]=0
+```
+#### 邻接表
+```python
+def add(a,b,c):#添加a向b的一条权值为c的边
+    global idx
+    e[idx]=b
+    w[idx]=c
+    ne[idx]=head[a]
+    head[a]=idx
+    idx+=1
+
+e=[0]*M;ne=[0]*M;head=[-1]*N;idx=0;w=[0]*M
+
+i=head[x]#遍历x出发的所有边
+while i!=-1:
+    j=e[i]
+    d=w[i]
+    i=ne[i]
+```
+## [拓扑排序](https://www.acwing.com/problem/content/850/)（存在拓扑序当且仅当图是有向无环图）
+拓扑排序的目标是将所有节点排序，使得排在前面的节点不能依赖于排在后面的节点。
+```python
+def add(a,b):
+    global idx
+    e[idx]=b
+    ne[idx]=head[a]
+    head[a]=idx
+    idx+=1
+
+def topsort():
+    global hh,tt
+    for i in range(1,n+1):
+        if d[i]==0:
+            tt+=1;q[tt]=i
+    while hh<=tt:
+        t=q[hh];hh+=1
+        i=head[t]
+        while i!=-1:
+            j=e[i]
+            d[j]-=1
+            if d[j]==0:
+                tt+=1;q[tt]=j
+            i=ne[i]
+    return tt==n-1
+
+n,m=map(int,input().split())
+N=n+10;M=m+10
+e=[0]*M;ne=[0]*M;head=[-1]*N;idx=0
+d=[0]*N;q=[0]*N;hh=0;tt=-1
+for i in range(m):
+    x,y=map(int,input().split())
+    add(x,y)
+    d[y]+=1
+if topsort():
+    print(*q[:tt+1])
+else:
+    print(-1)
+```
+## 最短路
+
+### 单源最短路——Dijkstra——非负权图(基于贪心)
+#### [朴素Dijkstra](https://www.acwing.com/problem/content/851/)($O(n^2)$)——稠密图
+```python
+def add(a,b,c):
+    global idx
+    e[idx]=b
+    w[idx]=c
+    ne[idx]=head[a]
+    head[a]=idx
+    idx+=1
+
+def dijkstra():
+    dist[1]=0
+    for i in range(n-1):
+        t=-1
+        for j in range(1,n+1):
+            if not st[j] and (t==-1 or dist[j]<dist[t]):
+                t=j
+        st[t]=True
+        for j in range(1,n+1):
+            dist[j]=min(dist[j],dist[t]+g[t][j])
+    if dist[n]==float('inf'):
+        return -1
+    return dist[n]
+
+n,m=map(int,input().split())
+N=n+10
+g=[[float('inf')]*N for i in range(N)]
+dist=[float('inf')]*N;st=[False]*N
+for i in range(1,n+1):
+    g[i][i]=0
+for i in range(m):
+    a,b,c=map(int,input().split())
+    g[a][b]=min(g[a][b],c)
+
+print(dijkstra())
+```
+#### [堆优化Dijkstra](https://www.acwing.com/problem/content/852/)($O(mlog_2n)$)——稀疏图
+```python
+from heapq import heapify,heappush,heappop
+def add(a,b,c):
+    global idx
+    e[idx]=b
+    w[idx]=c
+    ne[idx]=head[a]
+    head[a]=idx
+    idx+=1
+
+def dijkstra():
+    q=[]
+    heapify(q)
+    dist[1]=0
+    heappush(q,(dist[1],1))
+    while q:
+        distance,ver=heappop(q)
+        if st[ver]:
+            continue
+        st[ver]=True
+        i=head[ver]
+        while i!=-1:
+            j=e[i]
+            if dist[j]>distance+w[i]:
+                dist[j]=distance+w[i]
+                heappush(q,(dist[j],j))
+            i=ne[i]
+    if dist[n]==float('inf'):
+        return -1
+    return dist[n]
+
+n,m=map(int,input().split())
+N=n+10;M=m+10
+e=[0]*M;ne=[0]*M;head=[-1]*M;idx=0;w=[0]*M
+dist=[float('inf')]*N;st=[False]*N
+for i in range(m):
+    a,b,c=map(int,input().split())
+    add(a,b,c)
+
+print(dijkstra())
+```
+### 单源最短路——有负权边(基于迭代)
+#### [bellman\_ford](https://www.acwing.com/problem/content/855/)($O(nm)$) —— 有边数限制的最短路只能用bellman_ford
+```python
+def bellman_ford():
+    dist[1]=0
+    for i in range(k):
+        backup=dist.copy()
+        for j in range(m):
+            a,b,c=edge[j]
+            dist[b]=min(dist[b],backup[a]+c)
+    if dist[n]==float('inf'):
+        return 'impossible'
+    return dist[n]
+
+n,m,k=map(int,input().split())
+N=n+10;M=m+10
+edge=[(0,0,0)]*M;dist=[float('inf')]*N
+for i in range(m):
+    a,b,c=map(int,input().split())
+    edge[i]=(a,b,c)
+print(bellman_ford())
+```
+#### [spfa](https://www.acwing.com/activity/content/problem/content/920/)($O(m)$)——特殊图上可能退化成($O(nm)$)
+```python
+from collections import deque
+def add(a,b,c):
+    global idx
+    e[idx]=b
+    w[idx]=c
+    ne[idx]=head[a]
+    head[a]=idx
+    idx+=1
+
+def spfa():
+    q=deque()
+    dist[1]=0
+    q.append(1)
+    st[1]=True
+    while q:
+        t=q.popleft()
+        st[t]=False
+        i=head[t]
+        while i!=-1:
+            j=e[i]
+            if dist[j]>dist[t]+w[i]:
+                dist[j]=dist[t]+w[i]
+                if not st[j]:
+                    q.append(j)
+                    st[j]=True
+            i=ne[i]
+    if dist[n]==float('inf'):
+        return 'impossible'
+    return dist[n]
+
+n,m=map(int,input().split())
+N=n+10;M=m+10
+e=[0]*M;ne=[0]*M;head=[-1]*N;idx=0;w=[0]*M
+dist=[float('inf')]*N;st=[False]*N
+
+for i in range(m):
+    a,b,c=map(int,input().split())
+    add(a,b,c)
+
+print(spfa())
+```
+#### [spfa判负环](https://www.acwing.com/problem/content/854/)
+```python
+from collections import deque
+def add(a,b,c):
+    global idx
+    e[idx]=b
+    w[idx]=c
+    ne[idx]=head[a]
+    head[a]=idx
+    idx+=1
+
+def spfa():
+    q=deque()
+    for i in range(1,n+1):
+        q.append(i)
+        dist[i]=0
+        st[i]=True
+    while q:
+        t=q.popleft()
+        st[t]=False
+        i=head[t]
+        while i!=-1:
+            j=e[i]
+            if dist[j]>dist[t]+w[i]:
+                dist[j]=dist[t]+w[i]
+                cnt[j]=cnt[t]+1
+                if cnt[j]>=n:
+                    return True
+                if not st[j]:
+                    q.append(j)
+                    st[j]=True
+            i=ne[i]
+    return False
+
+n,m=map(int,input().split())
+N=n+10;M=m+10
+e=[0]*M;ne=[0]*M;head=[-1]*N;w=[float('inf')]*M;idx=0
+dist=[float('inf')]*N;st=[False]*N;cnt=[0]*N
+for i in range(m):
+    a,b,c=map(int,input().split())
+    add(a,b,c)
+if spfa():
+    print('Yes')
+else:
+    print('No')
+```
+### 多源汇最短路
+#### [floyd](https://www.acwing.com/problem/content/856/)
+```python
+def floyd():
+    for k in range(1,n+1):
+        for i in range(1,n+1):
+            for j in range(1,n+1):
+                g[i][j]=min(g[i][j],g[i][k]+g[k][j])
+
+n,m,k=map(int,input().split())
+N=n+10
+g=[[float('inf')]*N for i in range(N)]
+dist=[float('inf')]*N
+for i in range(1,n+1):
+    g[i][i]=0
+for i in range(m):
+    x,y,z=map(int,input().split())
+    g[x][y]=min(g[x][y],z)
+floyd()
+for i in range(k):
+    x,y=map(int,input().split())
+    if g[x][y]==float('inf'):
+        print('impossible')
+    else:
+        print(g[x][y])
+```
+
+## 最小生成树
+### 定理：任意一棵最小生成树一定包含无向图中权值最小的边
+#### 朴素版[Prim算法](https://www.acwing.com/problem/content/860/) ($O(n^2)$)(稠密图)
+```python
+def prim():
+    res=0
+    for i in range(n):
+        t=-1
+        for j in range(1,n+1):          #每次找到距离当前连通块最近的点
+            if not st[j] and (t==-1 or dist[j]<dist[t]):
+                t=j
+        if i and dist[t]==float('inf'): #如果最近的点与连通块不连通，则不存在最小生成树
+            return 'impossible'
+        if i:                           #res+此点与连通块的距离
+            res+=dist[t]
+        st[t]=True                      #放入连通块
+        for j in range(1,n+1):          #更新所有点与连通块的距离
+            dist[j]=min(dist[j],g[t][j])
+    return res
+
+n,m=map(int,input().split())
+N=n+10
+g=[[float('inf')]*N for i in range(N)]
+dist=[float('inf')]*N;st=[False]*N
+for i in range(m):
+    a,b,c=map(int,input().split())
+    g[a][b]=g[b][a]=min(g[a][b],c)
+print(prim())
+```
+#### 堆优化Prim算法($O(mlog_2n)$)(稀疏图)
+没讲，不会
+
+#### [Kruskal](https://www.acwing.com/problem/content/861/) 算法($O(mlog_2m)$)(稀疏图)
+```python
+def kruskal():                  #维护无向图的最小生成森林
+    res=0
+    cnt=0
+    for i in range(m):          #枚举每条边
+        a,b,c=edges[i]
+        pa=find(a);pb=find(b)
+        if pa!=pb:              #若两座森林不连通，则使其连通
+            p[pa]=pb
+            res+=c
+            cnt+=1
+    if cnt<n-1:
+        return  'impossible'
+    return res
+
+def find(x):
+    if p[x]!=x:
+        p[x]=find(p[x])
+    return p[x]
+
+n,m=map(int,input().split())
+N=n+10
+p=[0]*N
+for i in range(1,n+1):          #每棵树最初自己是一座森林
+    p[i]=i
+edges=[]
+for i in range(m):
+    a,b,c=map(int,input().split())
+    edges.append((a,b,c))
+edges.sort(key=lambda x:x[2])   #按权重排序
+print(kruskal())
+```
+#### [次小生成树](https://www.acwing.com/problem/content/1150/)
+```python
+def find(x):
+    if p[x]!=x:
+        p[x]=find(p[x])
+    return p[x]
+
+def add(a,b,c):
+    global idx
+    e[idx]=b
+    w[idx]=c
+    ne[idx]=head[a]
+    head[a]=idx
+    idx+=1
+
+def kruskal():
+    res=0
+    for i in range(m):
+        a,b,c,f=edges[i]
+        pa=find(a);pb=find(b)
+        if pa!=pb:
+            p[pa]=pb
+            add(a,b,c);add(b,a,c)
+            edges[i][3]=True
+            res+=c
+    return res
+
+def dfs(u,fa,maxd1,maxd2,d1,d2):
+    d1[u]=maxd1;d2[u]=maxd2
+    i=head[u]
+    while i!=-1:
+        j=e[i]
+        if j!=fa:
+            td1=maxd1;td2=maxd2
+            if w[i]>td1:
+                td2=td1;td1=w[i]
+            elif td1>w[i]>td2:
+                td2=w[i]
+            dfs(j,u,td1,td2,d1,d2)
+        i=ne[i]
+    return
+
+n,m=map(int,input().split())
+N=n+10
+p=[0]*N
+e=[0]*N*2;ne=[0]*N*2;head=[-1]*N;w=[0]*N*2;idx=0
+dist1=[[0]*N for i in range(N)]
+dist2=[[0]*N for i in range(N)]
+for i in range(1,n+1):
+    p[i]=i
+edges=[]
+for i in range(m):
+    a,b,c=map(int,input().split())
+    edges.append([a,b,c,False])
+edges.sort(key=lambda x:x[2])
+suma=kruskal()                                              #求最小生成树
+for i in range(1,n+1):
+    dfs(i,-1,-float('inf'),-float('inf'),dist1[i],dist2[i]) #求树上任意两点间的最大边和次大边
+res=float('inf')
+for i in range(m):
+    a,b,c,f=edges[i]
+    if not f:                                               #用非树边替换树边，得次小生成树
+        if c>dist1[a][b]:                                   #替换最大边
+            t=suma+c-dist1[a][b]
+        elif c>dist2[a][b]:                                 #若最大边替换后和原来一样，则替换次大边
+            t=suma+c-dist2[a][b]
+        res=min(res,t)
+print(res)
+```
+
+## 差分约束
+![差分约束与最短路转换示意图](/posts/graph-theory/difference-constraints.png)
+
+## 最近公共祖先(LCA)
+![最近公共祖先与树上倍增示意图](/posts/graph-theory/lca.png)
+```python
+from collections import deque
+def add(a,b):
+    global idx
+    e[idx]=b
+    ne[idx]=head[a]
+    head[a]=idx
+    idx+=1
+
+def bfs(root):
+    depth[0]=0;depth[root]=1
+    q=deque()
+    q.append(root)
+    while q:
+        t=q.popleft()
+        i=head[t]
+        while i!=-1:
+            j=e[i]
+            if depth[j]>depth[t]+1:
+                depth[j]=depth[t]+1
+                q.append(j)
+                fa[j][0]=t
+                for k in range(1,16):
+                    fa[j][k]=fa[fa[j][k-1]][k-1]
+            i=ne[i]
+
+def lca(a,b):
+    if depth[a]<depth[b]:
+        a,b=b,a
+    for k in range(15,-1,-1):
+        if depth[fa[a][k]]>=depth[b]:
+            a=fa[a][k]
+    if a==b:
+        return a
+    for k in range(15,-1,-1):
+        if fa[a][k]!=fa[b][k]:
+            a=fa[a][k]
+            b=fa[b][k]
+    return fa[a][0]
+
+n=int(input())
+N=40010;M=2*n+10
+e=[0]*M;ne=[0]*M;head=[-1]*N;idx=0
+depth=[float('inf')]*N;fa=[[0]*16 for i in range(N)]
+for i in range(n):
+    a,b=map(int,input().split())
+    if b==-1:
+        root=a
+    else:
+        add(a,b);add(b,a)
+bfs(root)
+m=int(input())
+for i in range(m):
+    a,b=map(int,input().split())
+    p=lca(a,b)
+    if p==a:
+        print(1)
+    elif p==b:
+        print(2)
+    else:
+        print(0)
+
+```
+```cpp
+#include <bits/stdc++.h>
+
+using namespace std;
+using i64=long long;
+
+constexpr i64 inf=numeric_limits<i64>::max()/2;
+constexpr int N=40010;
+
+int main(){
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    int n;
+    cin>>n;
+
+    int root;
+    vector<vector<int>> edge(N);
+
+    for(int i=0;i<n;i++){
+        int a,b;
+        cin>>a>>b;
+        if(b==-1){
+            root=a;
+        }else{
+            edge[a].push_back(b);
+            edge[b].push_back(a);
+        }
+    }
+
+    vector<i64> depth(N,inf);
+    vector<vector<int>> fa(N,vector<int>(16,0));
+    auto bfs=[&](int root){
+        depth[0]=0,depth[root]=1;
+        queue<int> q;
+        q.push(root);
+        while(q.size()){
+            int u=q.front();
+            q.pop();
+            for(auto v:edge[u]){
+                if(depth[v]>depth[u]+1){
+                    depth[v]=depth[u]+1;
+                    q.push(v);
+                    fa[v][0]=u;
+                    for(int i=1;i<16;i++)
+                        fa[v][i]=fa[fa[v][i-1]][i-1];
+                }
+            }
+        }
+        return;
+    };
+
+    bfs(root);
+
+    auto lca=[&](int a,int b){
+        if(depth[a]<depth[b])
+            swap(a,b);
+        for(int i=15;i>=0;i--)
+            if(depth[fa[a][i]]>=depth[b])
+                a=fa[a][i];
+        if(a==b)
+            return a;
+        for(int i=15;i>=0;i--)
+            if(fa[a][i]!=fa[b][i])
+                a=fa[a][i],b=fa[b][i];
+        return fa[a][0];
+    };
+
+    int m;
+    cin>>m;
+    while(m--){
+        int x,y;
+        cin>>x>>y;
+        int p=lca(x,y);
+        if(p==x)
+            cout<<1<<"\n";
+        else if(p==y)
+            cout<<2<<"\n";
+        else
+            cout<<0<<"\n";
+    }
+
+
+    return 0;
+}
+```

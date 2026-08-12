@@ -1,0 +1,358 @@
+---
+title: "算法竞赛数学：数论、组合计数与博弈论"
+description: "一份算法竞赛数学速查笔记，覆盖模运算、质数、约数、快速幂、扩展欧几里得、中国剩余定理、高斯消元、组合计数与 SG 函数。"
+publishedAt: "2023-11-16"
+updatedAt: "2026-08-13"
+category: "技术"
+tags:
+  - "算法竞赛"
+  - "数学"
+  - "数论"
+  - "组合计数"
+featured: false
+draft: false
+---
+
+竞赛中的数学题往往不是考察单一公式，而是要求先识别结构，再选择正确的工具。这篇笔记把常用结论、实现模板和典型题目放在一起，方便按主题复习。
+
+> 公式旁保留了相应代码或练习入口；使用模板前仍应确认模数、数据范围和逆元存在条件。
+
+## **模运算**
+
+python除法是向下取整，求余应该先求出商再得出余数。
+python没有溢出问题。
+
+## 质数
+对于足够大的整数 $N$，不超过 $N$ 的质数数量大约为 $N / \ln N$。
+#### 质数的判定--试除法($O(\sqrt{n})$)
+```python
+n=30
+def is_prime(x):
+    if x<2:
+        return False
+    i=2
+    while i<=x//i:
+        if x%i==0:
+            return False
+        i+=1
+    return True
+```
+
+
+
+#### 质数的筛选(输出2~x之间的质数)
+##### 埃氏筛法($O(nloglogn)$)
+```python
+N=n+10
+st=[False]*N
+def primes(x):
+    for i in range(2,x+1):
+        if st[i]:continue
+        print(i,end=' ')
+        for j in range(i,x//i+1):
+            st[i*j]=True
+    return
+```
+
+##### 线性筛法($O(n)$)
+```python
+N=n+10
+prime=[0]*N
+st=[0]*N#记录st[i]的最小质因子
+def get_primes(x):
+    cnt=0#记录质数数量
+    for i in range(2,x+1):
+        if not st[i]:
+            st[i]=i;cnt+=1;prime[cnt]=i
+        j=1
+        while prime[j]<=x//i:
+            st[prime[j]*i]=prime[j]
+            if i%prime[j]==0:break
+            j+=1
+    print(*prime[1:cnt+1])
+    return
+```
+
+
+#### 算术基本定理：任何一个大于 1 的自然数可以分解成一些素数的乘积
+#### 质因数分解--试除法($O(\sqrt{n})$)
+```python
+def divide(x):
+    i=2
+    while i<=x//i:
+        if x%i==0:
+            s=0
+            while x%i==0:x//=i;s+=1
+            print(i,s)
+        i+=1
+    if x>1:
+        print(x,1)
+    return
+```
+
+## 约数
+从 $1$ 到 $N$ 的所有整数，其约数个数之和约为 $N\ln N$。
+
+在 $2\times 10^9$ 的值域内，约数最多的整数大约有 $1600$ 个约数，可用于估计枚举约数时的常数规模。
+#### 求x的约数集合--试除法($O(\sqrt{n})$)
+```python
+def get_divisors(x):
+    res=[]
+    i=1
+    while i<=x//i:
+        if x%i==0:
+            res.append(i)
+            if i!=x//i:res.append(x//i)
+        i+=1
+    res.sort();print(*res)
+    return
+```
+#### 算术基本定理推论
+##### 一个大于1的正整数N，如果它的标准分解式为：$n=p_1^{a_1}p_2^{a_2}…p_n^{a_n}$
+##### 那么它的正因数个数为$	τ(n)=(1+α_1)(1+α_2)…(1+α_n)$。
+##### 它的全体正因数之和为$σ(n)=(1+p_1+p_1^2+···+p_1^{α_1})(1+p_2+p_2^2+···+p_2^{α_2})···(1+p_n+p_n^2+···+p_n^{α_n})=(\frac{p_1^{a_1+1}-1}{p_1-1}\frac{p_2^{a_2+1}-1}{p_2-1}……\frac{p_n^{a_n+1}-1}{p_n-1})$
+[约数个数](https://www.acwing.com/problem/content/description/872/)
+[约数之和](https://www.acwing.com/problem/content/873/)
+[约数之和](https://www.acwing.com/problem/content/99/)(递归)
+#### 最大公约数--欧几里得算法($O(log(max(a,b)))$)
+```python
+def gcd(a,b):
+    return gcd(b,a%b) if b else a
+```
+#### 最小公倍数($lcm(x,y)\*gcd(x,y)=x\*y$)
+```python
+def lcm(x,y):
+	return x//gcd(x,y)*y
+```
+#### 欧拉函数
+![欧拉函数公式与推导](/posts/competitive-math/euler-function.png)
+[欧拉函数](https://www.acwing.com/problem/content/875/)
+##### 筛法求欧拉函数
+```python
+def get_primes(x):
+    phi[1]=1
+    cnt=0
+    for i in range(2,x+1):
+        if not st[i]:
+            st[i]=True;phi[i]=i-1
+            cnt+=1;prime[cnt]=i
+        j=1
+        while prime[j]<=x//i:
+            st[prime[j]*i]=True
+            if i%prime[j]==0:
+                phi[prime[j]*i]=phi[i]*prime[j]
+                break
+            phi[prime[j]*i]=phi[i]*(prime[j]-1)
+            j+=1
+```
+
+
+## 快速幂
+#### 分治写法
+```python
+def fastpow(a,n,m):
+    if n==0:
+        return 1
+    if n==1:
+        return a%m
+    temp=fastpow(a,n//2,m)
+    if n%2:
+        return temp*temp*a%m
+    else:
+        return temp*temp%m
+```
+#### 二进制倍增($O(log_2n)$)
+```python
+def fastpow(a,n,m):
+    ans=1%m
+    while n:
+        if n&1:ans=ans*a%m
+        a=a*a%m
+        n>>=1
+    return ans
+```
+[快速幂](https://www.acwing.com/problem/content/description/877/)
+![快速幂的二进制分解过程](/posts/competitive-math/fast-power.png)
+[快速幂求逆元](https://www.acwing.com/problem/content/878/)
+
+## 扩展欧几里得算法
+![扩展欧几里得算法的等式推导](/posts/competitive-math/extended-euclid-1.png)
+```python
+def bezout(a,b):
+    if not b:
+        return a,1,0
+    d,y,x=bezout(b,a%b)
+    y-=a//b*x
+    return d,x,y
+```
+![贝祖等式的递归推导](/posts/competitive-math/extended-euclid-2.png)
+![线性同余方程的转换过程](/posts/competitive-math/linear-congruence.png)
+[线性同余方程](https://www.acwing.com/problem/content/description/880/)
+## 中国剩余定理
+![中国剩余定理的构造公式](/posts/competitive-math/chinese-remainder-theorem.png)
+对于模数不两两互质的情况，可用数学归纳法：[表达整数的奇怪方式](https://www.acwing.com/problem/content/206/)
+
+## 高斯消元
+枚举每一列c，
+找到当前列绝对值最大的一行
+用初等行变换(2) 把这一行换到最上面（未确定阶梯型的行，并不是第一行）
+用初等行变换(1) 将该行的第一个数变成 1（其余所有的数字依次跟着变化）
+用初等行变换(3) 将下面所有行的当且列的值变成 0
+```python
+def gauss():
+    r=0
+    for c in range(n):
+        m=r
+        for i in range(r+1,n):
+            if abs(g[i][c])>abs(g[m][c]):
+                m=i
+        if abs(g[m][c])<eps:
+            continue
+        g[r],g[m]=g[m],g[r]
+        for i in range(n,c-1,-1):
+            g[r][i]/=g[r][c]
+        for i in range(r+1,n):
+            if abs(g[i][c])>eps:
+                for j in range(n,c-1,-1):
+                    g[i][j]-=g[i][c]*g[r][j]
+        r+=1
+    if r<n:
+        for i in range(r,n):
+            if abs(g[i][-1])>eps:
+                return 2
+        return 1
+    for i in range(n-1,-1,-1):
+        for j in range(i+1,n):
+            g[i][n]-=g[j][n]*g[i][j]
+    return 0
+
+n=int(input())
+g=[0]*n
+for i in range(n):
+    g[i]=list(map(float,input().split()))
+eps=1e-6
+t=gauss()
+if t==0:
+    for i in range(n):
+        if abs(g[i][n])<eps:
+            g[i][n]=0
+        print('{:.2f}'.format(g[i][-1]))
+elif t==1:
+    print('Infinite group solutions')
+else:
+    print('No solution')
+```
+
+## 组合计数
+#### 递推法求组合数($O(n^2)$)——[求组合数I](https://www.acwing.com/problem/content/887/)
+![组合数的递推关系](/posts/competitive-math/combinations.png)
+```python
+def init():
+    for i in range(N):
+        for j in range(i+1):
+            if j==0:
+                c[i][j]=1
+            else:
+                c[i][j]=(c[i-1][j-1]+c[i-1][j])%mod
+```
+#### 通过预处理逆元的方式求组合数($O(nlog_2n)$)——[求组合数II](https://www.acwing.com/problem/content/888/)
+首先预处理出所有阶乘取模的余数fact[N]，以及所有阶乘取模的逆元infact[N]
+如果取模的数是质数，可以用费马小定理求逆元
+```python
+def qmi(a,k,p):
+    res=1
+    while k:
+        if k&1:res=res*a%p
+        a=a*a%p
+        k>>=1
+    return res
+
+def init():
+    fact[0]=infact[0]=1
+    for i in range(1,N):
+        fact[i]=fact[i-1]*i%mod
+        infact[i]=infact[i-1]*qmi(i,mod-2,mod)%mod
+```
+#### Lucas定理($O(plog_pn)$)——[求组合数 III](https://www.acwing.com/problem/content/889/)
+![Lucas 定理的递归分解](/posts/competitive-math/lucas-theorem.png)
+```python
+def qmi(a,b,p):
+    res=1%p
+    while b:
+        if b&1:
+            res=res*a%p
+        a=a*a%p
+        b>>=1
+    return res
+
+def C(a,b):
+    if a<b:
+        return 0
+    up=1;down=1;j=a
+    for i in range(1,b+1):
+        up=up*j%p
+        down=down*i%p
+        j-=1
+    return up*qmi(down,p-2,p)%p
+
+def lucas(a,b):
+    if a<p and b<p:
+        return C(a,b)
+    return C(a%p,b%p)*lucas(a//p,b//p)%p
+```
+#### 分解质因数法求组合数($(O(n))$)——[求组合数IV](https://www.acwing.com/problem/content/890/)
+```python
+当我们需要求出组合数的真实值，而非对某个数的余数时，分解质因数的方式比较好用：
+    1. 筛法求出范围内的所有质数
+    2. 通过 C(a, b) = a! / b! / (a - b)! 这个公式求出每个质因子的次数。 n! 中p的次数是 n / p + n / p^2 + n / p^3 + ...
+    3.python无需高精度
+def get_primes(n):
+    global cnt
+    i=2
+    while i<=n:
+        if not st[i]:
+            cnt+=1;p[cnt]=i
+        j=1
+        while p[j]<=n//i:
+            st[p[j]*i]=True
+            if i%p[j]==0:break
+            j+=1
+        i+=1
+
+def get(n,p):
+    res=0
+    while n:
+        res+=n//p
+        n//=p
+    return res
+
+a,b=map(int,input().split())
+N=a+10
+st=[False]*N
+p=[0]*N
+c=[0]*N
+cnt=0
+get_primes(a)
+for i in range(1,cnt+1):
+    c[i]=get(a,p[i])-get(b,p[i])-get(a-b,p[i])
+res=1
+for i in range(1,cnt+1):
+    for j in range(c[i]):
+        res*=p[i]
+print(res)
+```
+#### 卡特兰数——[满足条件的01序列](https://www.acwing.com/problem/content/891/)
+![卡特兰数对应的合法路径](/posts/competitive-math/catalan-1.png)
+![卡特兰数路径的对称映射](/posts/competitive-math/catalan-2.png)
+
+## 容斥原理——[能被整除的数](https://www.acwing.com/problem/content/892/)
+![容斥原理的集合关系](/posts/competitive-math/inclusion-exclusion.png)
+
+## 博弈论与SG函数
+#### 博弈论——[Nim游戏](https://www.acwing.com/problem/content/893/)
+![Nim 游戏的状态转移示例](/posts/competitive-math/nim-1.png)
+![Nim 游戏异或结论的推导](/posts/competitive-math/nim-2.png)
+
+#### SG函数——[集合-Nim游戏](https://www.acwing.com/problem/content/895/)
+![SG 函数与后继状态集合](/posts/competitive-math/sg-1.png)
+![有向图游戏中的 SG 值](/posts/competitive-math/sg-2.png)

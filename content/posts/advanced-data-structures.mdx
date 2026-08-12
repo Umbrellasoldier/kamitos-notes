@@ -1,0 +1,375 @@
+---
+title: "高级数据结构：树状数组、线段树与 Splay"
+description: "整理树状数组、线段树和 Splay 的核心操作、复杂度与实现模板，覆盖区间查询、懒标记和动态平衡树。"
+publishedAt: "2023-11-16"
+updatedAt: "2026-08-13"
+category: "技术"
+tags:
+  - "算法竞赛"
+  - "数据结构"
+  - "线段树"
+  - "Splay"
+featured: false
+draft: false
+---
+
+当数组需要频繁修改和查询时，朴素扫描往往无法满足复杂度要求。这篇笔记从树状数组开始，逐步过渡到线段树和 Splay，重点保留各结构解决的问题与可复用实现。
+
+> 模板默认下标从 1 开始。真正使用时，应根据题目确认值域、节点容量和整数类型。
+
+## 树状数组
+### 基本操作
+
+
+**1.（单点修改+区间查询）（可与差分数组结合）（$O(log_2n)$）**
+```python
+def lowbit(x):#返回x的最后一位1
+    return x&-x
+
+def add(x,d):#给第x个数加上d
+    while x<=n:
+        tree[x]+=d
+        x+=lowbit(x)
+
+def suma(x):#查询前x个数的和
+    res=0
+    while x>0:
+        res+=tree[x]
+        x-=lowbit(x)
+    return res
+```
+
+**2. （区间修改+区间查询） （$O(log_2n)$）**
+$\sum_1^ka_i=a_1+a_2+...+a_k$
+$=D_1+(D_1+D_2)+(D_1+D_2+D_3)+... +(D_1+D_2+...+D_k)$
+$=kD_1+(k-1)D_2+(k-2)D_3+...+(k-(k-1))D_k$
+$=k(D_1+D_2+...+D_k)−(D_2+2D_3+...+(k−1)D_k)$
+$=k\sum_{i=1}^kD_i-\sum_{i=1}^k(i-1)D_i$
+```python
+def lowbit(x):
+    return x&-x
+
+def add(tree,x,d):
+    while x<=n:
+        tree[x]+=d
+        x+=lowbit(x)
+
+def suma(tree,x):
+    res=0
+    while x>0:
+        res+=tree[x]
+        x-=lowbit(x)
+    return res
+tree1=[0]*N#维护Di
+tree2=[0]*N#维护(i-1)Di
+#区间修改
+add(tree1,x,k)
+add(tree1,y+1,-k)
+add(tree2,x,(x-1)*k)
+add(tree2,y+1,y*(-k))
+#区间查询
+print((y*suma(tree1,y)-(x-1)*suma(tree1,x-1))-(suma(tree2,y)-suma(tree2,x-1)))
+```
+
+## 线段树
+```cpp
+#include <bits/stdc++.h>
+
+using i64=long long;
+
+constexpr int MAXN=100010;
+
+struct Node{
+    int l,r;
+    i64 sum,max,gcd,lcm;
+    int maxcnt,zerocnt;
+    i64 lmax,rmax,tmax;
+    i64 add;
+};
+
+struct Segment_Tree{
+    i64 a[MAXN];
+    Node tr[MAXN<<2];
+
+    void merge(Node &u,Node &l,Node &r){
+        u.sum=l.sum+r.sum;
+        u.max=std::max(l.max,r.max);
+
+        if(l.max>r.max) u.maxcnt=l.maxcnt;
+        else if(l.max<r.max) u.maxcnt=r.maxcnt;
+        else u.maxcnt=l.maxcnt+r.maxcnt;
+
+        u.gcd=std::__gcd(l.gcd,r.gcd);
+        // u.lcm=std::lcm(l.lcm,r.lcm);
+        u.zerocnt=l.zerocnt+r.zerocnt;
+
+        u.lmax=std::max(l.lmax,l.rmax+r.lmax);
+        u.rmax=std::max(r.rmax,l.rmax+r.lmax);
+        u.tmax=std::max(l.tmax,r.tmax);
+        u.tmax=std::max(u.tmax,l.rmax+r.lmax);
+    }
+
+    void init_data(int u,i64 val){
+        tr[u].sum=val;
+        tr[u].max=val,tr[u].maxcnt=1;
+        tr[u].gcd=val,tr[u].lcm=val;
+        tr[u].zerocnt=(val==0);
+        tr[u].lmax=tr[u].rmax=tr[u].tmax=val;
+    }
+
+    void init_tag(int u){
+        tr[u].add=0;
+    }
+
+    void build(int u,int l,int r){
+        tr[u].l=l,tr[u].r=r;
+        init_tag(u);
+        if(l==r){
+            init_data(u,a[l]);
+            return;
+        }
+        int mid=l+r>>1;
+        build(u<<1,l,mid),build(u<<1|1,mid+1,r);
+        merge(tr[u],tr[u<<1],tr[u<<1|1]);
+    }
+
+    void modify_point(int u,int x,i64 y){
+        if(tr[u].l==x&&tr[u].r==x){
+            init_data(u,y);
+            return;
+        }
+        int mid=tr[u].l+tr[u].r>>1;
+        if(x<=mid){
+            modify_point(u<<1,x,y);
+        }else if(x>mid){
+            modify_point(u<<1|1,x,y);
+        }
+        merge(tr[u],tr[u<<1],tr[u<<1|1]);
+    }
+
+    void addtag(int u,i64 x){
+        tr[u].add+=x;
+        tr[u].sum+=x*(tr[u].r-tr[u].l+1);
+    }
+
+    void push(int u){
+        if(tr[u].add){
+            addtag(u<<1,tr[u].add);
+            addtag(u<<1|1,tr[u].add);
+            init_tag(u);
+        }
+    }
+
+    Node query(int u,int l,int r){
+        if(l<=tr[u].l&&tr[u].r<=r){
+            return tr[u];
+        }
+        // push(u);// work if modify_range
+        int mid=tr[u].l+tr[u].r>>1;
+        if(r<=mid)
+            return query(u<<1,l,r);
+        if(l>mid)
+            return query(u<<1|1,l,r);
+        Node res,left=query(u<<1,l,r),right=query(u<<1|1,l,r);
+        merge(res,left,right);
+        return res;
+    }
+
+    void modify_range(int u,int l,int r,i64 x){
+        if(l<=tr[u].l&&tr[u].r<=r){
+            addtag(u,x);
+            return;
+        }
+        push(u);
+        int mid=tr[u].l+tr[u].r>>1;
+        if(l<=mid)
+            modify_range(u<<1,l,r,x);
+        if(r>mid)
+            modify_range(u<<1|1,l,r,x);
+        merge(tr[u],tr[u<<1],tr[u<<1|1]);
+    }
+
+    int find_kzero(int u,int k){
+        if(tr[u].zerocnt<k)
+            return -1;
+        if(tr[u].l==tr[u].r){
+            return tr[u].l;
+        }
+        // push(u);// work if modify_range
+        if(tr[u<<1].zerocnt>=k)
+            return find_kzero(u<<1,k);
+        return find_kzero(u<<1,k-tr[u<<1].zerocnt);
+
+    }
+
+    // Searching for the first element greater than a given amount
+    int get_first(int u,int l,int r,int x){
+        if(tr[u].max<=x)
+            return -1;
+        if(tr[u].l==tr[u].r)
+            return l;
+        // push(u);// work if modify_range
+        int mid=tr[u].l+tr[u].r>>1;
+        if(r<=mid)
+            return get_first(u<<1,l,r,x);
+        if(l>mid)
+            return get_first(u<<1|1,l,r,x);
+        int left=get_first(u<<1,l,r,x);
+        if(left!=-1)
+            return left;
+        return get_first(u<<1|1,l,r,x);
+    }
+};
+
+
+
+```
+
+
+## Splay
+```cpp
+#include <bits/stdc++.h>
+
+using namespace std;
+using i64=long long;
+
+constexpr int MAXN=100010;
+
+struct Splay{
+    int root,idx;
+    struct Node{
+        int ch[2],fa,size,cnt;
+        i64 val;
+        void init(i64 v,int p){
+            val=v,fa=p;
+            size=1,cnt=1;
+        }
+    }tr[MAXN];
+
+    int chk(int x){
+        return tr[tr[x].fa].ch[1]==x;
+    }
+
+    void pushup(int x){
+        tr[x].size=tr[tr[x].ch[0]].size+tr[tr[x].ch[1]].size+tr[x].cnt;
+    }
+
+    void rotate(int x){
+        int y=tr[x].fa,z=tr[y].fa,k=chk(x);
+        tr[y].ch[k]=tr[x].ch[k^1],tr[x].ch[k^1]=y;
+        tr[z].ch[chk(y)]=x,tr[x].fa=z;
+        tr[x].ch[k^1]=y,tr[y].fa=x;
+        pushup(y),pushup(x);
+    }
+
+    void splay(int x,int k){
+        while(tr[x].fa!=k){
+            int y=tr[x].fa,z=tr[y].fa;
+            if(z!=k){
+                if(chk(x)==chk(y))
+                    rotate(y);
+                else
+                    rotate(x);
+            }
+            rotate(x);
+        }
+        if(!k)
+            root=x;
+    }
+
+    void find(i64 x){
+        if(!root)
+            return;
+        int u=root;
+        while(tr[u].ch[x>tr[u].val]&&tr[u].val!=x)
+            u=tr[u].ch[x>tr[u].val];
+        splay(u,0);
+    }
+
+    void insert(i64 x){
+        int u=root,p=0;
+        while(u&&tr[u].val!=x){
+            p=u,u=tr[u].ch[x>tr[u].val];
+        }
+        if(u){
+            tr[u].cnt++;
+        }else{
+            u=++idx;
+            if(p)
+                tr[p].ch[x>tr[p].val]=u;
+            tr[u].init(x,p);
+        }
+        splay(u,0);
+    }
+
+    int kth(int k){
+        int u=root;
+        while(true){
+            if(tr[tr[u].ch[0]].size>=k){
+                u=tr[u].ch[0];
+            }else if(tr[tr[u].ch[0]].size+tr[u].cnt<k){
+                k-=tr[tr[u].ch[0]].size+tr[u].cnt;
+                u=tr[u].ch[1];
+            }else{
+                splay(u,0);
+                return u;
+            }
+        }
+    }
+
+    int rank(i64 x){
+        int res=0,u=root;
+        while(u){
+            if(tr[u].val>x){
+                u=tr[u].ch[0];
+            }else{
+                res+=tr[tr[u].ch[0]].size;
+                if(tr[u].val==x){
+                    splay(u,0);
+                    return res+1;
+                }
+                res+=tr[u].cnt;
+                u=tr[u].ch[1];
+            }
+        }
+        return res+1;
+    }
+
+    int pre(i64 x){
+        find(x);
+        if(tr[root].val<x)
+            return root;
+        int u=tr[root].ch[0];
+        while(tr[u].ch[1])
+            u=tr[u].ch[1];
+        splay(u,0);
+        return u;
+    }
+
+    int succ(i64 x){
+        find(x);
+        if(tr[root].val>x)
+            return root;
+        int u=tr[root].ch[1];
+        while(tr[u].ch[0])
+            u=tr[u].ch[0];
+        splay(u,0);
+        return u;
+    }
+
+    void remove(i64 x){
+        int last=pre(x),next=succ(x);
+        splay(last,0),splay(next,last);
+        int del=tr[next].ch[0];
+        if(tr[del].cnt>1){
+            tr[del].cnt--;
+            splay(del,0);
+        }else{
+            tr[next].ch[0]=0;
+        }
+        pushup(next),pushup(last);
+    }
+
+
+};
+```

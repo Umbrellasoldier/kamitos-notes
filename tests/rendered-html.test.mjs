@@ -28,7 +28,7 @@ test("首页呈现正式品牌、精选旧文且不会重复", async () => {
   const html = await response.text();
   assert.match(html, /<title>Kamito(?:'|&#x27;)s Notes<\/title>/i);
   assert.match(html, /记录技术、生活与思考/);
-  assert.match(html, /src="\/avatar\.png"/);
+  assert.match(html, /src="\/og\.png"/);
   assert.match(html, /欢迎来到 Kamito/);
   assert.match(html, /算法竞赛进阶指南：基本算法与数据结构/);
   assert.doesNotMatch(html, /target="_top"/);
@@ -59,6 +59,14 @@ test("主要页面和聚合页均可渲染", async () => {
     "/posts/algorithm-competition-guide",
     "/posts/string-algorithms",
     "/posts/greedy-exchange-argument",
+    "/posts/graph-theory",
+    "/posts/competitive-math",
+    "/posts/advanced-data-structures",
+    "/posts/atcoder-abc-solutions",
+    "/posts/fundamental-algorithms",
+    "/posts/search-algorithms",
+    "/posts/fundamental-data-structures",
+    "/posts/python-competitive-template",
     "/about",
     "/categories",
     "/categories/%E6%8A%80%E6%9C%AF",
@@ -83,6 +91,26 @@ test("迁移文章保留目录、公式和代码高亮", async () => {
   assert.match(html, /用交换论证推导贪心排序规则/);
 });
 
+test("新整理文章保留合并结构、本地图片和代码高亮", async () => {
+  const dataStructures = await render("/posts/fundamental-data-structures");
+  assert.equal(dataStructures.status, 200);
+  const dataStructuresHtml = await dataStructures.text();
+  assert.match(dataStructuresHtml, /基础数据结构：线性结构、二叉树、堆与并查集/);
+  assert.match(dataStructuresHtml, /class="toc"/);
+  assert.match(dataStructuresHtml, /data-rehype-pretty-code-figure/);
+  assert.match(dataStructuresHtml, /href="\/posts\/string-algorithms"/);
+
+  const graphTheory = await render("/posts/graph-theory");
+  assert.equal(graphTheory.status, 200);
+  const graphTheoryHtml = await graphTheory.text();
+  assert.match(graphTheoryHtml, /src="\/posts\/graph-theory\/graph-storage-1\.png"/);
+  assert.match(graphTheoryHtml, /class="katex"/);
+
+  const pythonTemplate = await render("/posts/python-competitive-template");
+  assert.equal(pythonTemplate.status, 200);
+  assert.match(await pythonTemplate.text(), /sys\.stdin\.buffer\.read/);
+});
+
 test("不存在的文章返回 404", async () => {
   const response = await render("/posts/does-not-exist");
   assert.equal(response.status, 404);
@@ -96,6 +124,7 @@ test("RSS、站点地图和 robots 只包含已发布内容", async () => {
   const rssText = await rss.text();
   assert.match(rssText, /欢迎来到 Kamito/);
   assert.match(rssText, /算法竞赛进阶指南/);
+  assert.match(rssText, /AtCoder ABC 题解集/);
 
   const sitemap = await render("/sitemap.xml");
   assert.equal(sitemap.status, 200);
@@ -104,6 +133,14 @@ test("RSS、站点地图和 robots 只包含已发布内容", async () => {
   assert.match(sitemapText, /\/posts\/algorithm-competition-guide/);
   assert.match(sitemapText, /\/posts\/string-algorithms/);
   assert.match(sitemapText, /\/posts\/greedy-exchange-argument/);
+  assert.match(sitemapText, /\/posts\/graph-theory/);
+  assert.match(sitemapText, /\/posts\/competitive-math/);
+  assert.match(sitemapText, /\/posts\/advanced-data-structures/);
+  assert.match(sitemapText, /\/posts\/atcoder-abc-solutions/);
+  assert.match(sitemapText, /\/posts\/fundamental-algorithms/);
+  assert.match(sitemapText, /\/posts\/search-algorithms/);
+  assert.match(sitemapText, /\/posts\/fundamental-data-structures/);
+  assert.match(sitemapText, /\/posts\/python-competitive-template/);
   assert.match(sitemapText, /\/categories\/%E6%8A%80%E6%9C%AF/);
   assert.match(sitemapText, /\/categories\/%E9%9A%8F%E7%AC%94/);
 

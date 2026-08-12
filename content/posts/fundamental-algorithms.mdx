@@ -1,0 +1,347 @@
+---
+title: "基础算法笔记：双指针、二分、前缀和与贪心"
+description: "从复杂度分析出发，整理双指针、二分与三分、倍增、前缀和、差分、离散化、排序和贪心等基础算法。"
+publishedAt: "2023-11-16"
+updatedAt: "2026-08-13"
+category: "技术"
+tags:
+  - "算法竞赛"
+  - "基础算法"
+  - "二分"
+  - "贪心"
+featured: false
+draft: false
+---
+
+这篇笔记集中整理竞赛中最常用的基础方法。与单纯罗列模板相比，更重要的是理解每种方法能把哪一类朴素复杂度降下来，以及使用时需要维持什么不变量。
+
+> 建议先读复杂度与双指针，再按二分、倍增、前缀和、排序和贪心的顺序复习。
+
+## **算法复杂度**
+衡量算法性能的主要对象是时间复杂度，同时也要在内存限制严格时关注空间复杂度。
+
+[由数据范围反推算法复杂度以及算法内容](https://www.acwing.com/file_system/file/content/whole/index/content/3074/)
+
+
+## **尺取法(双指针)**优化序列区间问题
+$O(n^2)$->$O(n)$
+指针$i,j$方向相反：左右指针；方向相同：快慢指针(产生一个大小可变的滑动窗口)。
+```text
+朴素算法
+for(i=0;i<n;i++)
+{
+    for(j=0;j<n;j++)
+    //O(n^2)
+}//双指针算法：将上述朴素算法优化到O(n)
+```
+```text
+双指针算法
+for(i=0,j=0;i<n;i++)
+{
+    while(j<i&&check(i,j))j++;
+
+    //每道题目的具体逻辑
+}
+```
+
+### 反向扫描
+[数组元素的目标和](https://www.acwing.com/problem/content/description/802/)
+[回文字符串](https://www.acwing.com/problem/content/3612/)
+[有效回文串](https://www.lintcode.com/problem/415/description)
+[有效回文 II](https://www.lintcode.com/problem/891/record)
+
+### 同向扫描
+[Subsequence ](https://www.acwing.com/file_system/file/content/whole/index/content/7736394/)
+[Bound Found](https://www.acwing.com/solution/content/161595/)
+[最长连续不重复子序列](https://www.acwing.com/activity/content/code/content/4004765/)
+### 数组去重
+1)哈希(利用哈希函数有冲突的特点去重，哈希表需要空间较大)
+2)尺取法
+```python
+#数组去重
+a=list(map(int,input().split()))
+n=len(a)
+a.sort()#排序后重复元素会挤到一起
+i=0#快指针
+j=0#慢指针，指向不重复的最后一个元素
+while i<n-1:
+    i+=1
+    if a[i]!=a[j]:#若a[i]!=a[j],则将a[i]放到a[j]后面
+        j+=1
+        a[j]=a[i]
+print(a[:j+1])
+```
+[删除有序数组中的重复项](https://leetcode.cn/problems/remove-duplicates-from-sorted-array/)
+[移除元素](https://leetcode.cn/problems/remove-element/)
+### 多指针
+[A-B 数对](https://www.acwing.com/solution/content/161386/)
+[三数之和](https://leetcode.cn/problems/3sum/)
+尺取法在链表中的应用：[常用的双指针技巧](https://leetcode.cn/circle/article/GMopsy/)
+[双指针知识点题库](https://leetcode.cn/tag/two-pointers/problemset/)
+
+
+
+## **二分法**
+
+### 整数二分
+**找x的后继**
+```python
+def bisearch(a,x):
+    l=0
+    r=len(a)-1
+    while l<r:
+        mid=l+r>>1
+        if a[mid]>=x:
+            r=mid
+        else:
+            l=mid+1
+    return l
+```
+**找x的前驱**
+```python
+def bisearch(a,x):
+    l=0
+    r=len(a)-1
+    while l<r:
+        mid=l+r+1>>1
+        if a[mid]<=x:
+            l=mid
+        else:
+            r=mid-1
+    return l
+```
+
+
+**二分STL(bisect)**
+```python
+from bisect import bisect_left,bisect#二分库
+a=[1,2,3,3,4,5,6,7,7,7,8,8]
+print(bisect_left(a,3))#若x已存在，则返回能插入的最左边的位置->升序序列中，返回>=x的第一个数的下标->bisect_left(a,x)-1即返回最后一个<x的数下标
+print(bisect(a,3))#若x已存在，则返回能插入的最右边的位置->升序序列中，返回>x的第一个数的下标->bisect(a,x)-1即返回最后一个<=x的数下标
+```
+**整数二分建模**
+```text
+while l<r:
+    mid=l+r>>1
+    if check(mid):
+        ans=mid
+    else:
+        pass
+```
+[进击的奶牛](https://www.acwing.com/solution/content/161933/)
+[跳石头](https://www.acwing.com/solution/content/162449/)
+[聪明的质监员](https://www.acwing.com/file_system/file/content/whole/index/content/7789149/)
+[Monthly Expense S](https://www.acwing.com/solution/content/162616/)
+**实数二分**
+```text
+eps=1e-7 #精度，需要仔细设计
+while r-l>eps:
+    mid=(l+r)/2
+    if check(mid):
+        r=mid
+    else:
+        l=mid
+```
+[Pie](https://www.acwing.com/solution/content/161995/)
+[Expanding Rods ](https://www.acwing.com/file_system/file/content/whole/index/content/7792736/)
+
+
+
+## **三分法**
+注意：单峰（单谷）函数两边要严格单调，否则可能在一边$f(mid1)==f(mid2)$，无法缩小区间。
+**实数三分**
+[【模板】三分法](https://www.acwing.com/solution/content/162676/)
+[函数](https://www.luogu.com.cn/problem/P1883)
+[UmBasketella](https://www.acwing.com/solution/content/162858/)
+**整数三分**
+```text
+while l<r:
+    mid1=(2*l+r)//3
+    mid2=(l+2*r+2)//3
+    if check(mid1)>check(mid2):
+        l=mid1+1
+    else:
+        r=mid2-1
+```
+## **倍增法与ST算法**
+**1.倍增法**$O(2^n)$从小区间到大区间；从小数值到大数值
+把一个数二进制展开：$N=a_02^0+a_12^1+a_22^2+a_32^3+a_42^4+……$
+二进制划分反映了一种快速增长的特性：$2^i=2^{i-1}+2^{i-2}+……+2^1+2^0+1$
+局限性：需要提前计算$1,2,4,……,2^k$个跳板，数据必须是静态的，如果变化，那么所有跳板必须重新计算。
+[国旗计划](https://www.acwing.com/problem/content/2669/)
+**2.ST算法**适用于静态空间的RMQ
+[天才的记忆](https://www.acwing.com/activity/content/code/content/5241680/)
+[Balanced Lineup G](https://www.luogu.com.cn/problem/P2880)
+
+## **前缀和与差分**
+前缀和是差分的逆运算；差分数组对“区间修改”高效，但对“单点查询”不高效。
+一维：
+[前缀和](https://www.acwing.com/problem/content/797/)
+[Subsequences Summing to Sevens S](https://www.luogu.com.cn/problem/P3131)
+[激光炸弹](https://www.acwing.com/problem/content/101/)
+[差分](https://www.acwing.com/problem/content/description/799/)
+[最高的牛](https://www.acwing.com/problem/content/103/)
+二维：
+[子矩阵的和](https://www.acwing.com/problem/content/description/798/)
+[差分矩阵](https://www.acwing.com/problem/content/800/)
+[地毯](https://www.luogu.com.cn/problem/P3397)
+[Monitor](https://www.acwing.com/solution/content/163551/)
+三维：**压维**
+[三维前缀和与三维差分](https://blog.csdn.net/qq_44296342/article/details/108150105)
+[三体攻击](https://www.acwing.com/problem/content/description/1234/)
+
+
+
+## **离散化** 用相对值代替绝对值
+步骤：1.排序；2离散化；3.归位
+**离散化手工编码**
+```python
+n=int(input())
+a=[0]+list(map(int,input().split()))
+old=[(0,0)]*(n+1)
+new=[(0,0)]*(n+1)
+for i in range(1,n+1):
+    old[i]=(a[i],i)
+old.sort(key=lambda x:x[0])
+for i in range(1,n+1):
+    new[old[i][1]]=i
+    # 若两个元素值相同，赋成同样的值
+    # if old[i][0]==old[i-1][0]:
+    #     new[old[i][1]]=new[old[i-1][1]]
+for i in range(1,n+1):
+    print(new[i],end=' ')
+```
+**STL实现离散化** 不去重
+```python
+from bisect import bisect_left
+n=int(input())
+old=[0]+list(map(int,input().split()))
+new=old.copy()
+old.sort()
+for i in range(1,n+1):
+    new[i]=bisect_left(old,new[i])
+for i in range(1,n+1):
+    print(new[i],end=' ')
+```
+[区间和](https://www.acwing.com/problem/content/804/)
+
+
+## **排序与排列**
+
+**排序函数**
+sort()
+sorted()
+[奖学金](https://www.luogu.com.cn/problem/P1093)
+
+**排列**
+全排列的算法复杂度为$O(n!)$
+1.[Python的排列组合函数](https://zhuanlan.zhihu.com/p/473353113)
+2.自写排列函数
+**$A_n^n$**
+```python
+def dfs(s,t):
+    if s==t:
+        for i in range(t):
+            print(b[i],end=' ')
+        print()
+        return
+    for i in range(t):
+        if not vis[i]:
+            b[s]=a[i]
+            vis[i]=True
+            dfs(s+1,t)
+            vis[i]=False
+
+a=[1,2,3,4,5,6,7,8,9,10,11,12,13]
+vis=[False]*20
+b=[0]*20
+
+n=3
+dfs(0,n)
+```
+**$A_n^m$**
+```python
+def dfs(s,t,m):
+    if s==m:
+        for i in range(m):
+            print(b[i],end=' ')
+        print()
+        return
+    for i in range(t):
+        if not vis[i]:
+            b[s]=a[i]
+            vis[i]=True
+            dfs(s+1,t,m)
+            vis[i]=False
+
+a=[1,2,3,4,5,6,7,8,9,10,11,12,13]
+vis=[False]*20
+b=[0]*20
+
+n=4
+m=3
+dfs(0,n,m)
+```
+[蓝桥杯2016省赛C++A组第6题.寒假作业](https://www.acwing.com/file_system/file/content/whole/index/content/7845248/)
+
+**分治法**
+[最大子段和](https://www.acwing.com/solution/content/158873/)
+[南蛮图腾](https://www.acwing.com/solution/content/163912/)
+[2的幂次方](https://www.acwing.com/problem/content/description/3486/)
+[分形](https://www.acwing.com/problem/content/120/)
+1.汉诺塔
+[汉诺塔](https://www.lanqiao.cn/problems/1512/learning/)
+2.快速幂(标准写法不是分治，而是二进制倍增)
+```python
+def fastpow(a,n,m):
+    if n==0:
+        return 1
+    if n==1:
+        return a
+    temp=fastpow(a,n//2,m)
+    if n%2:
+        return temp*temp*a%m
+    return temp*temp%m
+
+a,n,m=map(int,input().split())
+print(fastpow(a,n,m))
+```
+
+**归并排序**
+[归并排序](https://www.acwing.com/problem/content/description/789/)
+[逆序对的数量](https://www.acwing.com/problem/content/description/790/)
+[Inversion](https://www.acwing.com/solution/content/163844/)
+
+**快速排序**
+[快速排序](https://www.acwing.com/problem/content/description/787/)
+[第k个数](https://www.acwing.com/problem/content/788/)
+
+
+
+## **贪心法与拟阵**
+**贪心法**
+特征：
+1.最优子结构性质。当一个问题的最优解包含其子问题的最优解时，称此问题具有最优子结构性质，也称此问题满足最优性原理。局部最优扩展到全局最优。
+2.贪心选择性质。问题的整体最优解可以通过一系列局部最优的选择得到。
+
+**拟阵**
+如果一个问题满足拟阵结构，那么贪心能得到最优解。
+
+[最大不相交区间数量](https://www.acwing.com/problem/content/910/)
+[游戏预言](https://www.acwing.com/solution/content/164093/)
+[Hero](https://www.acwing.com/solution/content/164111/)
+[Aaronson](https://www.acwing.com/solution/content/164114/)
+[搭配牛奶](https://www.acwing.com/problem/content/1350/)
+[跳跳！](https://www.luogu.com.cn/problem/P4995)
+[纪念品分组 ](https://www.acwing.com/problem/content/432/)
+[三国游戏](https://www.acwing.com/problem/content/446/)
+[推销员](https://www.acwing.com/solution/content/4533/)
+
+
+
+
+
+
+## **补充**
+
+[区间合并](https://www.acwing.com/problem/content/description/805/)

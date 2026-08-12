@@ -1,0 +1,125 @@
+---
+title: "Python 算法竞赛输入输出与常用模板"
+description: "从简单快读到整包读取，整理 Python 竞赛中的输入、输出、递归深度、常用模块和一份可直接复制的程序骨架。"
+publishedAt: "2023-11-16"
+updatedAt: "2026-08-13"
+category: "技术"
+tags:
+  - "算法竞赛"
+  - "Python"
+  - "模板"
+  - "输入输出"
+featured: false
+draft: false
+---
+
+竞赛中的输入输出模板应该保持简单：普通数据优先使用 `sys.stdin.buffer.readline`，只有输入规模极大且解析整数成为瓶颈时，才考虑一次性读取。模板越复杂，调试成本和隐藏错误通常越多。
+
+## 常用快读
+
+逐行读取适合绝大多数题目。二进制接口省去一层文本包装，调用 `.split()` 后可以直接交给 `map(int, ...)`。
+
+```python
+import sys
+
+input = sys.stdin.buffer.readline
+
+n, m = map(int, input().split())
+values = list(map(int, input().split()))
+```
+
+读取字符串时需要根据需求决定是否解码：
+
+```python
+text = input().strip().decode()
+```
+
+如果后续只比较 ASCII 字符，也可以保留 `bytes`，避免不必要的转换。
+
+## 一次性读取全部整数
+
+输入几乎全部由整数构成时，可以一次读取并创建迭代器：
+
+```python
+import sys
+
+numbers = iter(map(int, sys.stdin.buffer.read().split()))
+n = next(numbers)
+m = next(numbers)
+edges = [(next(numbers), next(numbers)) for _ in range(m)]
+```
+
+这种方式速度快、代码短，但失去了行结构，也不适合混合字符串输入。
+
+## 输出
+
+少量输出直接使用 `print`。需要累计大量结果时，先保存字符串再一次写出：
+
+```python
+import sys
+
+answer = []
+for value in values:
+    answer.append(str(value))
+
+sys.stdout.write("\n".join(answer))
+```
+
+不要在循环中频繁拼接长字符串；列表追加再 `join` 通常更稳定。
+
+## 递归深度
+
+Python 默认递归深度较小。深度优先搜索可能沿一条链递归到 $O(n)$ 层时，需要提高限制：
+
+```python
+import sys
+
+sys.setrecursionlimit(1_000_000)
+```
+
+这只放宽解释器限制，并不会增加实际栈空间。面对特别深的搜索，显式栈通常比递归更安全。
+
+## 常用标准库
+
+| 任务 | 模块或函数 |
+| --- | --- |
+| 双端队列、BFS | `collections.deque` |
+| 计数 | `collections.Counter` |
+| 小根堆 | `heapq` |
+| 二分查找 | `bisect_left`、`bisect_right` |
+| 排列组合 | `itertools.permutations`、`combinations` |
+| 前缀累计 | `itertools.accumulate` |
+| 最大公约数、最小公倍数 | `math.gcd`、`math.lcm` |
+| 精确小数 | `decimal.Decimal` |
+| 自定义比较排序 | `functools.cmp_to_key` |
+
+只导入实际需要的函数，可以让模板更容易阅读，也能避免变量名冲突。
+
+## 推荐程序骨架
+
+```python
+import sys
+from collections import deque
+from heapq import heappop, heappush
+from math import gcd
+
+input = sys.stdin.buffer.readline
+
+def solve():
+    n = int(input())
+    values = list(map(int, input().split()))
+
+    # 在这里实现算法。
+    print(sum(values))
+
+def main():
+    test_cases = 1
+    # test_cases = int(input())
+    for _ in range(test_cases):
+        solve()
+
+if __name__ == "__main__":
+    main()
+```
+
+如果题目包含多组数据，只需启用 `test_cases = int(input())`。不要默认把所有题都套进复杂模板；从最短、最清楚的骨架开始，再根据题目加入需要的数据结构与工具。

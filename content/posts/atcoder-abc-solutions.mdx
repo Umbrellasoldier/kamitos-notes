@@ -1,0 +1,814 @@
+---
+title: "AtCoder ABC 题解集"
+description: "持续整理的 AtCoder Beginner Contest 题解，记录从组合数学、动态规划到图论与字符串算法的关键思路和实现。"
+publishedAt: "2024-02-09"
+updatedAt: "2026-08-13"
+category: "技术"
+tags:
+  - "算法竞赛"
+  - "AtCoder"
+  - "题解"
+  - "动态规划"
+featured: false
+draft: false
+---
+
+这是一份按题号积累的 AtCoder Beginner Contest 题解集。较完整的条目包含算法推导、复杂度和代码，较短的条目则记录决定解法的关键观察。
+
+> 这篇长文适合通过目录按题号查阅，也可以把它当作不同算法模型的练习索引。
+
+## ABC-042-D. Iroha and a Grid
+### 算法
+##### (组合数学、逆元)  $O(nlog_2n)$
+
+从$(1,1)$走到$(a,b)$的方案数为$C_{a+b-2}^{a-1}$，即$a+b-2$步中选$a-1$步向右走。
+先走到$(i,b)(1<=i<=h-a)(C_{i+b-2}^{i-1})$，再从$(i,b)$走到$(h,w)(C_{h-i+w-b-1}^{h-i})$,(必有一步向右)。
+#### 时间复杂度
+逆元求组合数$O(nlog_2n)$
+
+#### python 代码
+```python
+def solve():
+    def qmi(a,k,p):
+        res=1
+        while k:
+            if k&1:res=res*a%p
+            a=a*a%p
+            k>>=1
+        return res
+
+    def init():
+        fact[0]=infact[0]=1
+        for i in range(1,N):
+            fact[i]=fact[i-1]*i%mod
+            infact[i]=infact[i-1]*qmi(i,mod-2,mod)%mod
+    def C(a,b):
+        return fact[a]*infact[b]*infact[a-b]%mod
+
+    h,w,a,b=map(int,input().split())
+    N=h+w+10;mod=1000000007
+    fact=[0]*N;infact=[0]*N
+    init()
+    # ans=C(h+w-2,h-1)%mod
+    ans=0
+    for i in range(1,h-a+1):
+        ans=(ans+C(i+b-2,i-1)*C(h-i+w-b-1,h-i)%mod)%mod
+    print(ans)
+    return
+
+
+solve()
+
+```
+
+## ABC-043-D Unbalanced
+
+### 算法
+##### (暴力枚举)  $O(n)$
+
+判断是否出现aa或aba即可。
+
+#### python 代码
+```python
+def solve():
+    s=input()
+    n=len(s)
+    for i in range(1,n):
+        if s[i]==s[i-1]:
+            print(i,i+1)
+            return
+        if i-2>=0 and s[i]==s[i-2]:
+            print(i-1,i+1)
+            return
+    print(-1,-1)
+    return
+
+solve()
+
+```
+
+## ABC-044-C. Tak and Cards
+
+### 算法1
+##### (DP)  $O(n^3x)$
+
+$dp[i][j][k]$ 表示前 $i$ 张卡中选择 $j$ 张、总和为 $k$ 的方案数。
+
+$$
+dp[i][j][k]=dp[i-1][j][k]+dp[i-1][j-1][k-x[i]]
+$$
+
+#### 时间复杂度
+
+#### 参考文献
+
+#### python 代码
+```python
+def solve():
+    n,a=map(int,input().split())
+    x=[0]+list(map(int,input().split()))
+    s=sum(x)
+    dp=[[[0]*(s+1) for i in range(n+1)] for j in range(n+1)]
+    dp[0][0][0]=1
+    for i in range(1,n+1):
+        for j in range(i+1):
+            for k in range(s+1):
+                dp[i][j][k]=dp[i-1][j][k]
+                if j>=1 and k>=x[i]:
+                    dp[i][j][k]+=dp[i-1][j-1][k-x[i]]
+    ans=0
+    for i in range(1,n+1):
+        if i*a<=s:
+            ans+=dp[n][i][i*a]
+    print(ans)
+    return
+```
+
+----------
+
+### 算法2
+##### (DP)  $O(n^2x)$
+
+求前i张总和为j的方案数，在求平均值a方案数时需要枚举选的张数。可将x都减去a，这样平均值就变成0，就不需要枚举张数了。变成求前i张总和为0的方案数。总和可能为负数，枚举范围时需注意。
+
+#### 时间复杂度
+
+#### 参考文献
+
+
+#### python 代码
+```python
+def solve():
+    n,a=map(int,input().split())
+    x=[0]+list(map(int,input().split()))
+    pos=0;neg=0
+    for i in range(1,n+1):
+        x[i]-=a
+        if x[i]>0:
+            pos+=x[i]
+        else:
+            neg-=x[i]
+    s=pos+neg
+    dp=[[0]*(s+1) for i in range(n+1)]
+    dp[0][0]=1
+    for i in range(1,n+1):
+        for j in range(-neg,pos+1):
+            dp[i][j]=dp[i-1][j]
+            if j-x[i]>=-neg:
+                dp[i][j]+=dp[i-1][j-x[i]]
+    print(dp[n][0]-1)
+    return
+```
+
+## ABC-044-D. Digit Sum
+
+#### (数学) $O(\sqrt(n))$
+
+```text
+1.n<s,-1
+2.n==s,b=n+1
+3.n>s
+    1.b<=sqrt(n),枚举b后check
+    2.b>sqrt(n),n<b^2,最多为2位数,设为x,y
+        {s=x+y;n=xb+y}->b=(n-s)/x+1
+        x<b->x<(n-s)/x+1->x<=sqrt(n-s)
+        从大到小枚举x并check。
+```
+```python
+def solve():
+    def f(b,n):
+        if n<b:
+            return n
+        return f(b,n//b)+n%b
+
+    n=int(input())
+    s=int(input())
+    if n<s:
+        print(-1)
+    elif n==s:
+        print(n+1)
+    else:
+        b=2
+        while b*b<=n:
+            if f(b,n)==s:
+                print(b)
+                return
+            b+=1
+        x=int(sqrt(n-s))
+        while x>=1:
+            if (n-s)%x==0:
+                b=(n-s)//x+1
+                if f(b,n)==s:
+                    print(b)
+                    return
+            x-=1
+        print(-1)
+    return
+```
+
+## ABC-045-D. Snuke''s Coloring
+
+##### (哈希)  $O(n)$
+
+每个九宫格以中心格点为代表。每增加一个黑格，它所在的 $9$ 个九宫格的黑格数都增加 $1$；更新时先将旧数量对应的 `ans` 减 $1$，再将新数量对应的 `ans` 加 $1$。
+
+#### python 代码
+```python
+def solve():
+    h,w,n=map(int,input().split())
+    cnt={};ans=[0]*10
+    ans[0]=(h-2)*(w-2)
+    for i in range(n):
+        a,b=map(int,input().split())
+        for j in range(-1,2):
+            for k in range(-1,2):
+                x=a+j;y=b+k
+                if 1<x<h and 1<y<w:
+                    cnt[(x,y)]=cnt.get((x,y),0)+1
+                    ans[cnt[(x,y)]]+=1
+                    ans[cnt[(x,y)]-1]-=1
+    for i in range(10):
+        print(ans[i])
+    return
+```
+
+## ABC051 D - Candidates of No Shortest Paths
+
+$floyd$ 跑最短路，枚举每条边$[a,b,c]$ ，看是否存在$dist[i][a]+c==dist[b][j]$ 即可。$O(mn^2)$。
+或判断$dist[i][a]+c==dist[i][b]$。
+```python
+def solve():
+    n,m=map(int,input().split())
+    dist=[[inf]*n for i in range(n)]
+    for i in range(n):
+        dist[i][i]=0
+    edge=[]
+    for i in range(m):
+        a,b,c=map(int,input().split())
+        a-=1;b-=1
+        edge.append([a,b,c])
+        dist[a][b]=dist[b][a]=c
+    for k in range(n):
+        for i in range(n):
+            for j in range(n):
+                dist[i][j]=min(dist[i][j],dist[i][k]+dist[k][j])
+    ans=0
+    for i in range(m):
+        f=False
+        for j in range(n):
+            for k in range(n):
+                if dist[j][edge[i][0]]+edge[i][2]+dist[edge[i][1]][k]==dist[j][k]:
+                    f=True
+                    break
+            if f:
+                break
+        if not f:
+            ans+=1
+    print(ans)
+    return
+```
+
+```python
+def solve():
+    n,m=map(int,input().split())
+    dist=[[inf]*n for i in range(n)]
+    for i in range(n):
+        dist[i][i]=0
+    edge=[]
+    for i in range(m):
+        a,b,c=map(int,input().split())
+        a-=1;b-=1
+        edge.append([a,b,c])
+        dist[a][b]=dist[b][a]=c
+    for k in range(n):
+        for i in range(n):
+            for j in range(n):
+                dist[i][j]=min(dist[i][j],dist[i][k]+dist[k][j])
+    ans=0
+    for i in range(m):
+        f=False
+        for j in range(n):
+            if dist[j][edge[i][0]]+edge[i][2]==dist[j][edge[i][1]]:
+                f=True
+        if not f:
+            ans+=1
+    print(ans)
+    return
+```
+
+##  ABC052C - Factors of Factorial
+### 算术基本定理推论
+#### 一个大于1的正整数N，如果它的标准分解式为：$n=p_1^{a_1}p_2^{a_2}…p_n^{a_n}$
+#### 那么它的正因数个数为$τ(n)=(1+α_1)(1+α_2)…(1+α_n)$。
+
+```python
+def solve():
+    n=int(input())
+    p={}
+    for i in range(1,n+1):
+        x=i
+        j=2
+        while j<=x//j:
+            while x%j==0:
+                p[j]=p.get(j,0)+1
+                x//=j
+            j+=1
+        if x>1:
+            p[x]=p.get(x,0)+1
+    ans=1;mod=1000000007
+    for i in p.values():
+        ans=ans*(1+i)%mod
+    print(ans)
+    return
+```
+
+ ## ABC053D - Card Eater
+ 每次操作可理解为删除两张。记重复牌数量为 $x$：若 $x$ 为偶数，正好可以全部删掉，剩 $n-x$ 张；否则还要多删除一张，剩 $n-x-1$ 张。答案为 $n-x-(x\bmod 2)$。
+
+ ## ABC054D - Mixing Experiment
+ $DP$:$f[i][j][k]$ 前 $i$ 个中选， $A$ 物质为$j$,$B$物质为 $k$ 的最小金额。
+ 状态转移方程:$f[i][j][k]=min(f[i-1][j][k],f[i-1][j-a[i]][k-b[i]]+c[i])$。
+
+```python
+ def solve():
+    n,ma,mb=map(int,input().split())
+    a=[0]*(n+1);b=[0]*(n+1);c=[0]*(n+1)
+    for i in range(1,n+1):
+        a[i],b[i],c[i]=map(int,input().split())
+    f=[[[inf]*401 for i in range(401)] for j in range(n+1)]
+    f[0][0][0]=0
+    for i in range(1,n+1):
+        for j in range(401):
+            for k in range(401):
+                f[i][j][k]=f[i-1][j][k]
+                if j>=a[i] and k>=b[i]:
+                    f[i][j][k]=min(f[i][j][k],f[i-1][j-a[i]][k-b[i]]+c[i])
+    ans=inf
+    i=1
+    while ma*i<=400 and mb*i<=400:
+        ans=min(ans,f[n][ma*i][mb*i])
+        i+=1
+    print(ans if ans!=inf else -1)
+    return
+```
+
+## ABC055D - Menagerie
+先枚举最初两个状态$['SS','SW','WW','WS']$,然后推出所有状态，最后用第 $n$ 个和第 $1$ 个进行$check$。
+
+## ABC056D - No Need
+先用背包求出 $f[j]$，表示总和为 $j$ 的方案数。再设 $ans[i][j]$ 表示不选择第 $i$ 个数、总和为 $j$ 的方案数，则 $ans[i][j]=f[j]-ans[i][j-a[i]]$。（经典回退背包）
+```cpp
+#include <bits/stdc++.h>
+
+using i64=long long;
+
+int main(){
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    int n,k;
+    std::cin>>n>>k;
+
+    std::vector<int> a(n+1);
+    for(int i=1;i<=n;i++)
+        std::cin>>a[i];
+
+    std::vector<i64> dp(k);
+    dp[0]=1;
+    for(int i=1;i<=n;i++)
+        for(int j=k-1;j>=a[i];j--)
+            dp[j]+=dp[j-a[i]];
+
+    i64 res=0;
+    std::vector<int> ans(k);
+    ans[0]=1;
+    for(int i=1;i<=n;i++){
+        bool f=false;
+        for(int j=0;j<k;j++){
+            ans[j]=dp[j];
+            if(j>=a[i])
+                ans[j]-=ans[j-a[i]];
+            if(j>=k-a[i]&&ans[j])
+                f=true;
+        }
+        res+=!f;
+    }
+    std::cout<<res<<"\n";
+
+    return 0;
+}
+```
+
+## ABC057D - Maximum Average Sets
+排序，选最大的A个。若这A个中最大的和最小的相等，则答案为$\sum_{i=a}^{min(maxcnt,b)}C_{maxcnt}^{i}$。
+否则设c为最大的A个中最小的数rangemin的个数，答案为$C_{rangemincnt}^{c}$。
+
+## ABC058D - \###
+计算每个最小矩阵的贡献:上下左右四条线的选法，即面积为$(x[i+1]-x[i])\times (y[j+1]-y[j])$ ,其贡献是$(n-1-i)\times (i+1) \times (m-1-j) \times (j+1)$ ,答案为$\sum_{i=0}^{n-2}\sum_{j=0}^{m-2}(x[i+1]-x[i])\times (y[j+1]-y[j])\times (n-1-i)\times (i+1) \times (m-1-j) \times (j+1)$ ,$O(nm)$。
+化简式子：$\sum_{i=0}^{n-2}(x[i+1]-x[i])\times (n-1-i)\times (i+1) \sum_{j=0}^{m-2}(y[j+1]-y[j])\times (m-1-j) \times (j+1)$ ,$i,j$ 两部分分布求,$O(max(n,m))$。
+```python
+def solve():
+    n,m=map(int,input().split())
+    mod=1000000007
+    x=list(map(int,input().split()))
+    y=list(map(int,input().split()))
+    X=0
+    for i in range(n-1):
+        X+=(x[i+1]-x[i])*(n-1-i)*(i+1)%mod
+    Y=0
+    for j in range(m-1):
+        Y+=(y[j+1]-y[j])*(m-1-j)*(j+1)%mod
+    ans=X*Y%mod
+    print(ans)
+    return
+test=1
+# test=int(input())
+for _ in range(test):
+    solve()
+```
+
+## ABC059C - Sequence
+枚举$s_1$ 为$+1,-1$，比较那种次数最小。
+
+
+## ABC059D - Alice&Brown
+若 $\lvert A-B\rvert\le 1$，先手输，因为后手一定可以通过移动与先手相同的石头再次达成 $\lvert A-B\rvert\le 1$。否则先手赢。
+
+## ABC060D - Simple Knapsack
+$N$ 很小，$w$ 差值最大为$4$ ，按不同重量$w$ 分类，每类里按价值从高到低排序，暴力枚举每种选多少，平均时间复杂度$(N/4)^4$。
+前缀和优化后计算每种选法价值为$O(1)$。
+
+
+## ABC061D - Score Attack
+将找最长路和判正环转化为找最短路和判负环，但要注意要找的是在最短路上的负环。
+具体做法：若从$1$ 到这个点的边超过$n-1$ ，则说明到它的路径上存在负环，将其标记不再用其跟新，若$n$ 被标记，证明$1$ 到$n$ 的路径上存在负环，否则$1$ 到$n$ 的路径不存在负环，其他路径上的负环也不会对这条路径产生影响(因为是有向图)。
+
+## ABC062C - Chocolate Bar
+若$h$ 或$w$ 是$3$ 的倍数，答案为$0$ 。
+否则分类讨论:$1$ .水平两刀:$w$ ,$2$ .竖直两刀:$h$ ,$3$ .左边水平一刀(放中间)，右边竖直一刀(枚举),$4$ .左边竖直一刀(枚举),右边水平一刀(放中间)。
+
+## ABC062D - 3N Numbers
+可以枚举前一段尾端:$n$ 到$2\*n$ ,要最大化前一段，最小化后一段。
+先考虑前一段，从前向后枚举尾端$i$ 过程中，向小根堆中插入新元素，并弹出最小的，并记录前$i$ 个元素最大的$n$ 个元素之和$pre[i]$。
+同理从后向前枚举$i$ 过程中记录后后端最小的$n$ 个元素之和$suf[i]$。
+最后枚举分界点$i$ ,用$pre[i]-suf[i]$ 更新最值。
+
+## ABC063D - Widespread
+二分答案最小次数$x$。$check$:枚举每个怪物，若$x$ 次小爆炸能解决就不管，否则再用大爆炸解决，计算大爆炸次数：剩余体力$ceil(h/(a-b))$ ，若总的大爆炸次数大于$x$ 则$false$ ,否则$true$。
+
+## ABC064D - Insertion
+用$l,r$ 统计$'('$ 和$')'$ 的个数，碰到$'('$ ,$l++$ ;碰到$')'$ ,若左边有$'('$ 能抵消,$l--$ ,否则$r++$ ;
+最后答案$'('\*r+s+')'\*l$ 。
+
+## ABC065D - Built?
+让$N$ 个点连通，且边权之和最小，即建立最小生成树。
+暴力建图会爆。
+距离为$min(\lvert x_i-x_j \rvert,\lvert y_i-y_j \rvert)$ ,考虑将$x,y$ 分开，建两条边，$\lvert x_i-x_j \rvert$ 和$\lvert y_i-y_j \rvert$ 。
+仅考虑$\lvert x_i-x_j \rvert$ ，对于每个点$x$ ，离其最近的的点必定是对$x$ 排序后点相邻的两点，只建这两条边即可。
+对$\lvert y_i-y_j \rvert$ 同理。
+这样总边数只有$m=2n-2$ 条，再跑$kruskal$ 即可。
+
+## ABC066D - 11
+选$i$ 个的方案数为$C(n+1,i)$ ，但要删去重复的部分，重复的部分只可能是有关那个重复的数字$x$ 的。
+重复部分的基本形式是：$????……???x????……?$。即在第一个$x$ 前选一些数，然后选$x$ ，再在后面一个$x$ 后面选一些数。
+设第一个$x$ 的下标(从$0$ 开始)为$l$ ，第二个$x$ 的下标为$r$ ，选$i$ 个的重复方案数为$C(l+n-r,i-1)$ 。
+则选$i$ 个的不重复方案数为$C(n+1,i)-C(l+n-r,i-1)$ 。
+
+## ABC067D - Fennec VS. Snuke
+由于是树，则$1$ 和$n$ 之间有且仅有一条路径，两人需要尽可能竞争这条路径上的点，这样才能得到更多的分支，因为是一人一步，所以这个点离谁更近就属于谁。对$1$ 和$n$ 分别$dfs$ ，记录每个点到他们的距离，距离谁更近就属于谁，最终比较属于$1$ 和$n$ 的点哪个更多。
+注意点：$1$ .距离相等点仅存在最多存在一个，因为是树，否则就存在环了，且这个点属于$1$ ，因为$1$ 是先手。$2$ .属于两个点的个数相等时，$1$ 输。
+
+## ABC071D - Coloring Dominoes
+从左向右遍历，边计算边打标记。
+若当前未打标记，分类讨论。
+1.竖着的，考虑左边的摆放情况：1.一个竖着的，$ans\*2$ ，2.两个横着的，$ans\*1$，3.左边没有，$ans\*3$。
+2.横着的，考虑左边的摆放情况：1.一个竖着的，$ans\*2$，2.两个横着的，$ans\*3$ ，3.左边没有，$ans\*6$。
+
+## ABC073D - joisino's travel
+$N$ 很小，直接跑$floyd$ ,$r$ 很小，直接枚举出所有拜访顺序，每个顺序都跑一遍。$O(max(n^3,r!n))$ 。
+
+```cpp
+#include <bits/stdc++.h>
+
+using i64=long long;
+
+constexpr int N=210;
+
+int dist[N][N];
+
+int main(){
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    int n,m,r;
+    std::cin>>n>>m>>r;
+
+    std::vector<int> R(r);
+    for(int i=0;i<r;i++)
+        std::cin>>R[i];
+
+    memset(dist,0x3f,sizeof dist);
+    for(int i=1;i<=n;i++)
+        dist[i][i]=0;
+    for(int i=0;i<m;i++){
+        int a,b,c;
+        std::cin>>a>>b>>c;
+        dist[a][b]=dist[b][a]=c;
+    }
+    for(int k=1;k<=n;k++)
+        for(int i=1;i<=n;i++)
+            for(int j=1;j<=n;j++)
+                dist[i][j]=std::min(dist[i][j],dist[i][k]+dist[k][j]);
+
+    i64 ans=LLONG_MAX;
+    std::sort(R.begin(),R.end());
+    do{
+        i64 res=0;
+        for(int i=0;i<r-1;i++){
+            res+=dist[R[i]][R[i+1]];
+        }
+        ans=std::min(ans,res);
+    }while(next_permutation(R.begin(),R.end()));
+
+    std::cout<<ans<<"\n";
+
+    return 0;
+}
+```
+
+## ABC074C - Sugar Water
+数据很小，直接$forforforfor$ 焯过去。
+注意$100A≤F≤3000$ ，密度为0的时候要保留一份水。
+
+## ABC074D - Restoring Road Network
+数据很小，直接$floyd$ 。跑$floyd$ 过程中如果有更新，则矩阵$A$ 不是最短路，输出$-1$ 。
+如果$dist[i][j]=dist[i][k]+dist[k][j]$ 且$k!=i,k!=j$，说明$edge_{i,j}$ 可被其他边替换，就不需要这条边。
+注意最终$ans/2$ ,因为是无向图，一条边被计算了两次。
+
+## ABC075C - Bridge
+数据很小，直接$dfs$ 。
+枚举每条边(枚举双向边中一条边即可)，$dfs$ 遍历一下，看是否能遍历到所有点，注意当前枚举的边和其反向边不要搜。$O(m(n+m))$ 。
+
+## ABC075D - Axis-Parallel Rectangle
+分别对$x$ 坐标和$y$ 坐标排序，枚举上下左右边界，$check$ 点数是否大于等于$k$ ，并更新答案。$O(n^5)$ 。
+
+## ABC077C - Snuke Festival
+枚举$b$，在$c$ 中二分大于$b_i$ 的第一个位置，算出大于$b_i$ 的个数。再对求出的结果反向前缀和，得到大于$b_i$ 的方案数。再枚举$a$ ，在$b$ 中二分出大于$a_i$ 的第一个位置，计算方案。
+
+## ABC078D - ABS
+$N==1$，答案为$\lvert a_1-w \rvert$。$N>=2$ ，因为对手也会采取最优策略，所以必须让其没得选，答案为$max(\lvert a_n-w \rvert,\lvert a_{n-1}-a_n \rvert)$。
+
+## ABC080D - Recording
+同一频道的用一个录音机，最多使用的录音机数量是同一时间录制的节目数，开一个时间轴统计每个时间有多少节目播放即可。而录制$s--t$ 的某频道节目，皆不能录制其他频道$s-0.5--t$ 的节目，所以把时间轴乘$2$。
+
+## ABC081D - Non-decreasing
+先考虑全为非负整数，做前缀和即可，$n-1$ 次操作。
+同理全为负数，反向前缀和即可。
+非负整数和负数都有，若非负数的绝对值更大，都变成非负整数，再做前缀和，反之同理。
+
+## ABC082D - FT Robot
+根据$s$ 得到每次连续走的步数和是在哪个方向走。
+若这个方向上的总步数小于坐标绝对值,$No$。
+否则多出的步数必定是偶数，不是偶数的话$No$。
+接下来只要看是否那些步数之和等于多出步数的一半即可，可用$DP$ 解决。
+注意若$s[0]=='F'$,则$x$ 方向第一步必为正，需要特殊处理。
+
+## ABC083D - Wide Flip
+当全部等于$0$，就不用反转，全部等于$1$，对整体反转。所以要使所有数字连续一致。
+若$s_i!=s_{i+1}$，可以将$s[:i+1]$ 或者$s[i:]$ 反转，使不连续一致的数字减少一。
+对于每个不相等的相邻两个数，求一下前缀长度和后缀长度的较大值的最小值。
+
+## ABC086D - Checker
+这个无限方格的最小单位是个$2K×2K$ 的方格，把所有坐标转换到最小单位方格内，白格坐标转换成黑格坐标$(x+=k)$ 。
+枚举左上方黑格点，得到两个$K×K$ 的方格内黑格的点数。
+可以开$4K×4K$ ，方便计算，注意同时将一个点复制到另外三个格中。
+
+## ABC087D - People on a Line
+从$L$ 向$R$ 建一条长度为$D$ 的边，再从$R$ 向$L$ 建一条长度为$-D$ 的边。
+遍历每个点，若当前点坐标未知，随便设一个值，再将其所在连通块里的点的坐标都求出来。
+
+## ABC089D - Practical Skill Test
+$L$ 每次走 $D$ 步到达 $R$，因此 $L\bmod D=R\bmod D$。对于每个数 $x$，求出同余类起点到 $x$ 的累计代价 $cost[x]$，答案为 $cost[R]-cost[L]$。
+
+求 $cost$ 的过程可以从 $cost[x\bmod D]$ 向后递推。用哈希表记录每个数的坐标，可以使单次递推为 $O(1)$，总复杂度为 $O(n)$。
+
+## ABC091C - 2D Plane 2N Points
+（板子）二分图最大匹配，数据很小，直接匈牙利算法，$O(n^3)$ 。
+
+## ABC092D - Grid Components
+开一个$100×100$ 的方格，上一半全黑，下一半全白。
+每增加一个白连通块，就在上一半里找一个黑方格，使其八连通区域(若选择四连通区域，则会增加黑连通块数量)内无白格，并将此黑格涂成白格。
+每增加一个黑连通块，同理。
+
+## ABC094D - Binomial Coefficients
+结论：选最大的数x和最靠近$\lfloor \frac{x+1}{2} \rfloor$ 的数$y$ 。
+证明：若选比$x$ 更小的数，$y$ 不变，必会变小。若选比$x$ 更小的数$nx$ ，且$y$ 也变小，更靠近$nx$ 的中间$ny$ ，此时对$nx$ 是最优解。但若此时将$nx$ 改为$x$ 答案会变大，再将$ny$ 改成$y$ 答案会更大。所以选$x$ 和$y$ 答案是最大的。
+
+## ABC095D - Static Sushi
+有四种走法：顺时针走到最大值，逆时针走到最大值，顺时针走到某点再逆时针走到剩余最大值，逆时针走到某点再顺时针走到剩余最大值。
+用前缀和维护获取能量前缀最大值和后缀最大值，因为改变方向需要先走回原点，这段距离需要减去，所以再维护一下走的距离前缀和和后缀和。
+
+## ABC096D - Five, Five Everywhere
+先筛质数，再选出个位数相同的$n$ 个数，因为任意$5$ 个个位相同的数，其和的各位是$5$ ，一定是$5$ 的倍数。
+
+## ABC097C - K-th Substring
+因为第$K$ 小的子串长度必不超过$K$ ，所以枚举所有长度不超过$K$ 的子串后排序即可。$O(NKlog(NK))$ 。
+
+## ABC097D - Equals
+如果经过一定操作使得$pi==i$，即使在做其他操作时，将$pi$ 作为跳板，也仍然能再次使$pi==i$ 。
+所以只要$pi$ 当前位置和目标位置连通即可，对交换关系用并查集维护后对每个数查询即可。
+
+## ABC098D - Xor Sum 2
+若选的区间内的数某一位有超过1个1，则会对前一位产生影响，使前一位异或值与和不等，所以选的区间的每一位的1的个数不超过一个。
+枚举每一个数为右端点，要找到其左端点，就枚举其每一位，若该位为1，则左端点至少为在该位有上一个1的数的右边，否则找到上上个1的位置，即上个1的上个1的位置，为此，需要预处理出每个数的每一位的前一个1的位置。O(Nlog(A))
+```python
+def solve():
+    n=int(input())
+    a=[0]+list(map(int,input().split()))
+    last=[[0]*20 for i in range(n+1)]
+    for i in range(2,n+1):
+        for j in range(20):
+            last[i][j]=last[i-1][j]
+            if a[i-1]>>j&1:
+                last[i][j]=i-1
+    ans=0
+    for i in range(1,n+1):
+        k=0
+        for j in range(20):
+            if a[i]>>j&1:
+                k=max(k,last[i][j]+1)
+            else:
+                k=max(k,last[last[i][j]][j]+1)
+        ans+=i-k+1
+    print(ans)
+    return
+```
+
+## ABC099D - Good Grid
+暴力枚举三种方格的颜色，当三色不同时将对应方格变成相应颜色。如果枚举颜色后再枚举方格时间复杂度为$O(C^3N^2)$。
+$O(CN^2)$ 预处理每种方格变成每种颜色所需总的花费，枚举颜色后直接$O(1)$。时间复杂度$O(CN^2+C^3)$ 。
+
+## ABC100D - Patisserie ABC
+枚举三项取绝对值之前取正还是负，或者说是否将这项乘$-1$ 。对于一个参数$x$ 来说，若其所在项为取正，则其贡献为$x$ ，若该项取负，则其贡献为$-x$ 。
+三项的符号决定好了，每个数的贡献也就决定了:$(+/-)x+(+/-)y+(+/-)z$ ，按照贡献排序，取最大的$m$ 个。$O(nlogn)$ 。
+
+## ABC103D - Islands War
+区间选点问题：选出最少数量的点，使得所给区间至少包含一个选出的点。
+按右端点排序，枚举每个点，看左端点是否在已枚举过的的区间左端，在右端的话就新增一个区间并更新右端点。
+
+## ABC104C - All Green
+数据很小，考虑$DP$。
+$dp[i][j]$:前$i$ 套题目中总共做了$j$ 题的最高得分。
+设第$i$ 套题目做了$k$ 题，状态转移方程:$dp[i][j]=dp[i-1][j-k]+k* i * 100+(k==p[i]?c[i]:0)$ 。
+
+## ABC105C - Base -2 Number
+因为$S$ 均为整数，所以每次对$2$ 求余，而不是$-2$，再将余数减掉后整除$-2$。
+
+## ABC105D - Candy Distribution
+先做前缀和。枚举 $r$，若 $s_{l\sim r}$ 是 $m$ 的倍数，则 $s_{l-1}$ 必定和 $s_r$ 模 $m$ 同余。用哈希表维护目前每个余数的出现次数，每次令 $ans\mathrel{+}=cnt[s_r\bmod m]$。
+
+## ABC106D - AtCoder Express 2
+法1:
+设$f[l][r]$ 为左端点为l，右端点为r的线段的个数。
+问题要求的是$f[p][p]+f[p][p+1]+……+f[p][q]+f[p+1][p+1]+……f[p+1][q]+……f[q][q]$ 。
+即求$\sum_{i=p}^q\sum_{j=i}^qf_{i,j}$。
+可以对内部做一个前缀和，就变成求$\sum_{i=p}^q(f_{i,q}-f_{i,i-1})$。
+$O(n^2+nQ)$ 。
+
+法2:
+区间$DP$:
+设$x[l][r]$ 为左端点为$l$  ，右端点为$r$ 的线段的个数。
+设$f[l][r]$ 为左端点大于等于$l$ ，右端点小于等于$r$ 的线段的个数。
+通过容斥得到状态转移方程$f[l][r]=x[l][r]+f[l+1][r]+f[l][r-1]-f[l+1][r-1]$ 。
+
+## ABC108C - Triangular Relationship
+看到加减和倍数，可以考虑余数。
+设 $a\bmod k=x$。要满足题目条件，需要 $b\bmod k=(k-x)\bmod k$、$c\bmod k=x$，并且 $2x\bmod k=0$。
+
+设 $mod[i]$ 为 $1$ 到 $n$ 中模 $k$ 为 $i$ 的数的个数。枚举余数 $i$，当 $2i\bmod k=0$ 时，贡献为 $mod[i]\times mod[(k-i)\bmod k]\times mod[i]$。
+
+## ABC110C - String Transformation
+一一对应:一种$s[i]$ 对应一种$t[i]$,一种$t[i]$ 对应一种$s[i]$ 。哈希判一下即可。
+
+## ABC112D - Partition
+假设答案为$g$ ,则每个数都是$g$ 的倍数,$m=kg,k>=n$ 。
+枚举$m$ 的因数，判断是否满足$k>=n$ 并更新即可。
+
+## ABC113D - Number of Amidakuji
+因为是从上落到下的，所以可以从上到下进行状态转移。
+设$dp[i][j]$ 为走到$(i,j)$ 的方案数。
+枚举第$i$ 行的横线状态，不能有两横线相邻。
+若$(i,j)$ 左右都无横线，则只能由$(i-1,j)$ 转移，若左边有横线，则可由$(i-1,j-1)$ 转移，若右边有横线，则可由$(i-1,j+1)$ 转移。
+
+## ABC114C - 755
+暴力枚举每位为$7,5,3$ 的情况。
+
+## ABC115D - 756
+求一个数的因数个数：
+分解质因数：$x=p_1^{a_1}p_2^{a_2}……p_n^{a_n}$
+$\sigma(x)=(1+a_1)(1+a_2)……(1+a_n)$
+$75=(1+74)=(1+24)(1+2)=(1+14)(1+4)=(1+4)(1+4)(1+2)$
+
+
+## ABC339E - Smooth Subsequence
+$dp[i]$ :以$a[i]$ 结尾的最大长度。
+$dp[i]=dp[j]+1$，其中 $\lvert a[i]-a[j]\rvert\le d$ 且 $j<i$。
+用值域线段树维护，值域为$a$，维护的是以a[i]结尾的最大长度。
+
+## ABC340F - S = 1
+三角形面积为 $1$，即向量 $(x,y)$ 和 $(a,b)$ 的叉积绝对值为 $2$：$\lvert ay-bx\rvert=2$。当 $2\bmod \gcd(a,b)\ne 0$ 时无解。
+
+## ABC342D - Square Pair
+两个数乘积为完全平方数：两个数相同；两个数不同，但都出去平方因子后相同。
+做法：将$A$ 中所有数除去平方因子，统计每种数的个数$x$ ，贡献为$C_x^2$ ，除了$0$ 外的每种数都要和$0$ 配对，即$c[0]×c[x]$ 。
+
+
+## ABC342E - Last Train
+设$N$ 号点最晚到达时间为$inf$ ，$Dijkstra$ 跑反向最长路。
+更新最晚时间时，注意不能小于$l$ ，不能大于$l+(k-1)*d$。
+```cpp
+#include <bits/stdc++.h>
+
+using namespace std;
+using i64=long long;
+
+constexpr i64 inf=numeric_limits<i64>::max()/2;
+
+
+struct train{
+    int A,l,d,k,c;
+};
+
+int main(){
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    int N,M;
+    cin>>N>>M;
+
+    vector<vector<train>> adj(N);
+    while(M--){
+        int l,d,k,c,A,B;
+        cin>>l>>d>>k>>c>>A>>B;
+        A--,B--;
+        adj[B].push_back({A,l,d,k,c});
+    }
+
+    vector<i64> dist(N,-1);
+    vector<bool> st(N,false);
+    priority_queue<pair<i64,int>> pq;
+    pq.emplace(inf,N-1);
+    while(!pq.empty()){
+        auto t=pq.top();
+        i64 distance=t.first;
+        int ver=t.second;
+        pq.pop();
+        if(st[ver])
+            continue;
+        st[ver]=true;
+        for(auto t:adj[ver]){
+            i64 m=distance-t.c;
+            if(m>=t.l){
+                m=t.l+min((m-t.l)/t.d,1ll*(t.k-1))*t.d;
+                if(dist[t.A]<m){
+                    dist[t.A]=m;
+                    pq.emplace(m,t.A);
+                }
+            }
+        }
+    }
+    for(int i=0;i<N-1;i++){
+        if(dist[i]==-1){
+            cout<<"Unreachable\n";
+        }else{
+            cout<<dist[i]<<"\n";
+        }
+    }
+
+
+    return 0;
+}
+```
+
+
+
+## ABC344D - String Bags
+爆搜会T一部分数据。
+$dp[i]$ :得到前$i$ 个字符串的最小代价。
+枚举每组的每个字符串，在枚举放这个字符的起点$k$ ，若能匹配，则转移:$dp[k+l-1]=min(dp[k+l-1],last[k-1]+1)$ 。
+注意只能从上一组的$dp$ 转移。
+
+## ABC344E - Insert or Erase
+链表模拟，想要实现$O(1)$ 删除某个数可以直接存该数的节点下标然后删。
+
+## ABC344F - Earn to Advance
+数据很小，考虑$DP$ 。
+$dp[i][j]=(min_step,max_leftmoney)$ :走到$(i,j)$ 的最小步数及此时的最大剩余金钱。
+枚举位置$(i,j)$ :枚举转移前的位置，使得在维持最小步数的同时能留下最大金钱。
+
+
+## ABC346E - Paint
+方格的最终状态取决于最后一次修改。
+反向枚举所有修改，此行/列修改过后不再修改。
+每次将a行修改成x，x的个数增加w-已经确定的列的数量。
+每次将a列修改成x，x的个数增加h-已经确定的行的数量。

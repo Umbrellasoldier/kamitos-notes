@@ -1,0 +1,261 @@
+---
+title: "基础数据结构：线性结构、二叉树、堆与并查集"
+description: "由四篇旧笔记合并整理，系统梳理链表、队列、栈、单调结构、二叉树、哈夫曼编码、堆与并查集。"
+publishedAt: "2023-11-16"
+updatedAt: "2026-08-13"
+category: "技术"
+tags:
+  - "算法竞赛"
+  - "数据结构"
+  - "二叉树"
+  - "堆"
+featured: false
+draft: false
+---
+
+这篇文章由《算法日记（基础数据结构篇）》《二叉树基础知识》《哈夫曼树和哈夫曼编码基础知识》和《堆基础知识》合并整理而成。重复的目录与学习记录已经删去，保留概念、操作、复杂度、模板和练习入口。
+
+## 如何选择数据结构
+
+| 需求 | 常用结构 | 典型复杂度 |
+| --- | --- | --- |
+| 频繁在已知位置插入或删除 | 链表 | 已知节点时 $O(1)$ |
+| 先进先出地扩展状态 | 队列 | 入队、出队 $O(1)$ |
+| 后进先出、括号匹配、表达式计算 | 栈 | 入栈、出栈 $O(1)$ |
+| 固定窗口的最大值或最小值 | 单调队列 | 总计 $O(n)$ |
+| 找到左右第一个更大或更小元素 | 单调栈 | 总计 $O(n)$ |
+| 动态取出当前最值 | 堆 | 插入、删除 $O(\log n)$ |
+| 维护元素之间的连通关系 | 并查集 | 近似 $O(1)$ |
+
+## 链表
+
+链表把数据存放在离散节点中，并通过指针或数组下标连接节点。与连续数组相比，它不适合随机访问，却能在已知节点位置时快速插入和删除。
+
+### 单链表
+
+单链表中的每个节点只记录后继。竞赛中常用数组模拟，以避免频繁分配对象：
+
+```python
+N = 100_010
+value = [0] * N
+next_node = [-1] * N
+head = -1
+index = 0
+
+def insert_after(node, x):
+    global index
+    value[index] = x
+    next_node[index] = next_node[node]
+    next_node[node] = index
+    index += 1
+
+def insert_head(x):
+    global head, index
+    value[index] = x
+    next_node[index] = head
+    head = index
+    index += 1
+
+def remove_after(node):
+    next_node[node] = next_node[next_node[node]]
+```
+
+练习：[反转链表](https://leetcode.cn/problems/UHnkqh/)、[合并两个有序链表](https://leetcode.cn/problems/merge-two-sorted-lists/)、[约瑟夫问题](https://www.acwing.com/solution/content/158434/)。
+
+### 双链表
+
+双链表同时记录前驱和后继，因此可以从一个已知节点向两个方向移动，也能在 $O(1)$ 时间删除该节点。实现时通常设置左右哨兵，减少对空链表和边界节点的特殊判断。
+
+练习：[队列安排](https://www.luogu.com.cn/problem/P1160)。
+
+## 队列与单调队列
+
+队列遵循先进先出。BFS、拓扑排序和任务调度都会使用它；Python 中优先使用 `collections.deque`：
+
+```python
+from collections import deque
+
+queue = deque([start])
+while queue:
+    node = queue.popleft()
+    for next_node in graph[node]:
+        if not visited[next_node]:
+            visited[next_node] = True
+            queue.append(next_node)
+```
+
+单调队列在普通队列的基础上维持单调性。以滑动窗口最小值为例：队尾元素如果不优于当前元素，以后也不可能成为答案，可以直接弹出。
+
+```python
+from collections import deque
+
+def sliding_minimum(values, window):
+    queue = deque()
+    answer = []
+    for index, value in enumerate(values):
+        while queue and queue[0] <= index - window:
+            queue.popleft()
+        while queue and values[queue[-1]] >= value:
+            queue.pop()
+        queue.append(index)
+        if index + 1 >= window:
+            answer.append(values[queue[0]])
+    return answer
+```
+
+练习：[滑动窗口](https://www.acwing.com/problem/content/156/)、[最大子序和](https://www.acwing.com/problem/content/137/)、[切蛋糕](https://www.luogu.com.cn/problem/P1714)。
+
+## 栈与单调栈
+
+栈遵循后进先出，常用于递归模拟、括号匹配、表达式求值以及维护尚未完成的状态。
+
+单调栈则让栈内元素保持单调，从而在线性时间内找到每个元素左侧或右侧第一个更大、更小的元素：
+
+```python
+def previous_smaller(values):
+    stack = []
+    answer = []
+    for value in values:
+        while stack and stack[-1] >= value:
+            stack.pop()
+        answer.append(stack[-1] if stack else -1)
+        stack.append(value)
+    return answer
+```
+
+练习：[表达式求值](https://www.acwing.com/problem/content/3305/)、[仰望奶牛](https://www.acwing.com/problem/content/description/3789/)。
+
+## 二叉树
+
+二叉树中的每个节点最多有两个孩子。它能够把一段规模为 $n$ 的问题递归拆分；一棵平衡二叉树通常只有 $O(\log n)$ 层，而极端不平衡时会退化成链。
+
+### 基本性质
+
+- 第 $i$ 层最多有 $2^{i-1}$ 个节点。
+- 高度为 $h$ 的满二叉树共有 $2^h-1$ 个节点。
+- 完全二叉树只允许最后一层不满，并且节点从左向右连续出现。
+- 在从 1 开始编号的完全二叉树中，节点 $i$ 的父节点是 $\lfloor i/2\rfloor$，左右孩子分别是 $2i$ 和 $2i+1$。
+
+完全二叉树很适合使用数组保存；一般二叉树则需要显式记录左右孩子。
+
+### 遍历
+
+- **层序遍历**：按深度逐层访问，本质是 BFS。
+- **先序遍历**：根、左、右。
+- **中序遍历**：左、根、右；二叉搜索树的中序序列有序。
+- **后序遍历**：左、右、根，适合由子树结果计算父节点结果。
+
+```python
+def preorder(node):
+    if node == 0:
+        return
+    visit(node)
+    preorder(left[node])
+    preorder(right[node])
+```
+
+已知中序遍历和先序或后序遍历，可以递归重建二叉树：先从先序首项或后序末项确定根，再用根在中序序列中的位置划分左右子树。
+
+练习：[FBI 树](https://www.luogu.com.cn/problem/P1087)、[求先序排列](https://www.luogu.com.cn/problem/P1030)、[对称二叉树](https://www.luogu.com.cn/problem/P5018)。
+
+## 哈夫曼树与哈夫曼编码
+
+叶子节点 $i$ 的权值为 $w_i$、深度为 $d_i$ 时，树的带权路径长度为：
+
+$$
+WPL=\sum_i w_i d_i
+$$
+
+在所有具有相同叶子权值的二叉树中，使 $WPL$ 最小的树称为哈夫曼树。构造时反复取出权值最小的两个节点，将它们合并为权值之和的新节点；这一贪心过程可以用小根堆实现。
+
+```python
+from heapq import heapify, heappop, heappush
+
+def huffman_cost(weights):
+    heapify(weights)
+    cost = 0
+    while len(weights) > 1:
+        merged = heappop(weights) + heappop(weights)
+        cost += merged
+        heappush(weights, merged)
+    return cost
+```
+
+哈夫曼编码把字符放在叶子上，并用向左、向右的路径分别表示 0 和 1。没有一个字符编码会成为另一个字符编码的前缀，因此可以唯一解码；频率越高的字符通常拥有越短的编码。
+
+练习：[合并果子](https://www.luogu.com.cn/problem/P1090)、[荷马史诗](https://www.acwing.com/problem/content/151/)。
+
+## 二叉堆与优先队列
+
+二叉堆是一棵满足堆序性质的完全二叉树。小根堆中，每个父节点都不大于孩子，因此堆顶始终是最小值。
+
+插入元素时先放到数组末尾，再不断与父节点比较并**上浮**；删除堆顶时用末尾元素替换根，再与更优的孩子交换并**下沉**。两种操作都只经过树高，复杂度为 $O(\log n)$；从最后一个非叶节点开始下沉可以在 $O(n)$ 时间建堆。
+
+```python
+class MinHeap:
+    def __init__(self):
+        self.data = [0]
+
+    def push(self, value):
+        self.data.append(value)
+        index = len(self.data) - 1
+        while index > 1 and self.data[index] < self.data[index // 2]:
+            parent = index // 2
+            self.data[index], self.data[parent] = self.data[parent], self.data[index]
+            index = parent
+
+    def pop(self):
+        result = self.data[1]
+        self.data[1] = self.data[-1]
+        self.data.pop()
+        index = 1
+        while index * 2 < len(self.data):
+            child = index * 2
+            if child + 1 < len(self.data) and self.data[child + 1] < self.data[child]:
+                child += 1
+            if self.data[index] <= self.data[child]:
+                break
+            self.data[index], self.data[child] = self.data[child], self.data[index]
+            index = child
+        return result
+```
+
+Python 实战中通常直接使用标准库：
+
+```python
+from heapq import heapify, heappop, heappush
+
+heap = [5, 3, 1, 4]
+heapify(heap)
+heappush(heap, 2)
+smallest = heappop(heap)
+```
+
+## 并查集
+
+并查集维护若干互不相交的集合，支持查询代表元和合并集合。路径压缩配合按大小合并后，单次操作的均摊复杂度近似常数。
+
+```python
+class DisjointSetUnion:
+    def __init__(self, size):
+        self.parent = list(range(size))
+        self.component_size = [1] * size
+
+    def find(self, node):
+        if self.parent[node] != node:
+            self.parent[node] = self.find(self.parent[node])
+        return self.parent[node]
+
+    def union(self, left, right):
+        left_root = self.find(left)
+        right_root = self.find(right)
+        if left_root == right_root:
+            return False
+        if self.component_size[left_root] < self.component_size[right_root]:
+            left_root, right_root = right_root, left_root
+        self.parent[right_root] = left_root
+        self.component_size[left_root] += self.component_size[right_root]
+        return True
+```
+
+字符串匹配部分已经单独整理在[《字符串算法专题：从 KMP 到 AC 自动机》](/posts/string-algorithms)，这里不再重复。
