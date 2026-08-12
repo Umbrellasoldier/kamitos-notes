@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import Link from "next/link";
+import Link from "@/components/site-link";
 
 export const metadata: Metadata = {
   title: "关于",

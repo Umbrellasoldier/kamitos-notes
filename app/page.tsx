@@ -1,4 +1,4 @@
-import Link from "next/link";
+import Link from "@/components/site-link";
 import { PostCard } from "@/components/post-card";
 import { getAllPosts, getCategories } from "@/lib/posts";
 

@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import Link from "next/link";
+import Link from "@/components/site-link";
 import { notFound } from "next/navigation";
 import { CodeCopyButtons } from "@/components/code-copy";
 import { getAllPosts, getPostBySlug } from "@/lib/posts";

@@ -31,6 +31,8 @@ test("首页呈现正式品牌、精选旧文且不会重复", async () => {
   assert.match(html, /src="\/avatar\.png"/);
   assert.match(html, /欢迎来到 Kamito/);
   assert.match(html, /算法竞赛进阶指南：基本算法与数据结构/);
+  assert.match(html, /target="_top"/);
+  assert.doesNotMatch(html, /\/_next\/static\/chunks\/link-[^"]+\.js/);
   assert.equal(
     (html.match(/<article class="post-card post-card-featured"/g) ?? []).length,
     1,
