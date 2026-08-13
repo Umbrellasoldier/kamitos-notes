@@ -59,6 +59,12 @@ export default async function PostPage({ params }: PageProps) {
               <span>Kamito</span>
               <p>
                 <time dateTime={post.publishedAt}>{formatDate(post.publishedAt)}</time>
+                {post.updatedAt && post.updatedAt !== post.publishedAt ? (
+                  <>
+                    {" · 更新于 "}
+                    <time dateTime={post.updatedAt}>{formatDate(post.updatedAt)}</time>
+                  </>
+                ) : null}
               </p>
             </div>
           </div>

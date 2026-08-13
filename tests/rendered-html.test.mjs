@@ -101,6 +101,11 @@ test("CS336 第一讲笔记包含课程主线、BPE 实现和官方资料", asyn
   assert.match(html, /class="katex-display"/);
   assert.match(html, /data-rehype-pretty-code-figure/);
   assert.match(html, /train_bpe/);
+  assert.match(html, /o200k_base/);
+  assert.match(html, /Byte Latent Transformer/);
+  assert.match(html, /Foundation Models and Fair Use/);
+  assert.match(html, /assignment5-alignment/);
+  assert.match(html, /更新于.*2026年8月14日/);
   assert.match(html, /cs336\.stanford\.edu\/lectures\/\?trace=lecture_01/);
   assert.match(html, /github\.com\/stanford-cs336\/assignment1-basics/);
 });
