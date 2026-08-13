@@ -57,6 +57,10 @@ $$
 - 某些任务在小模型上几乎没有进展，扩大规模后才出现明显能力，[涌现能力论文](https://arxiv.org/abs/2206.07682)把这种现象定义为无法从较小模型表现直接外推的能力；不过[后续研究](https://arxiv.org/abs/2304.15004)指出，非连续评价指标也可能制造“突然出现”的表象，因此这里更适合把它理解为外推风险，而不是已经确定的尺度机制；
 - 在小实验中有效的数据配比或结构选择，不保证原样迁移到更大规模。
 
+![八项任务的表现随训练计算量增加而变化，其中多项任务在较大规模才出现明显提升](/posts/cs336-lecture-01-overview-tokenization/wei-emergence-plot.png)
+
+*图：第一讲用这组曲线说明小模型表现未必能平滑外推到大模型；曲线也应结合评价指标是否连续来解读。来源：[Stanford CS336 第一讲讲义](https://cs336.stanford.edu/lectures/?trace=lecture_01)。*
+
 因此，课程强调的“机制”和“效率思维”迁移性较强，而具体设计直觉只能部分迁移。我们仍然要做小实验，但要知道结论的适用范围。
 
 ### 课程适合谁，也不解决什么
@@ -102,6 +106,10 @@ CS336 将从头训练语言模型拆成五个相互咬合的模块：
 
 这些选择最终要平衡三个目标：**表达能力**足以拟合复杂依赖，**稳定性**让参数和梯度处于合理范围，**效率**则要求训练与推理都能在硬件上跑得足够快。
 
+![语言模型的 Transformer 堆叠结构，以及单个 pre-norm Transformer block 的内部组成](/posts/cs336-lecture-01-overview-tokenization/transformer-architecture.png)
+
+*图：从 token 与位置嵌入开始，经过多层因果自注意力和前馈网络，再由归一化与输出层得到 token 概率。来源：[Stanford CS336 第一讲讲义](https://cs336.stanford.edu/lectures/?trace=lecture_01)。*
+
 第一次作业会实现 BPE、Transformer、交叉熵、AdamW 与训练循环，完成资源核算，并在 TinyStories 和 OpenWebText 上训练。讲义给出的排行榜目标是在一张 B200、45 分钟预算内尽量降低 OpenWebText 困惑度。
 
 ### 2. 系统：瓶颈常常是搬运而非计算
@@ -109,6 +117,10 @@ CS336 将从头训练语言模型拆成五个相互咬合的模块：
 系统单元从资源核算开始。训练参数量为 $N$、token 数为 $D$ 的稠密 Transformer 时，常用 $C\approx6ND$ 估计前向与反向计算；例如 70B 参数、1T token 的量级约为 $4.2\times10^{23}$ FLOPs。
 
 但理论 FLOPs 不等于真实速度。参数需要从 HBM 搬到计算单元，Roofline 分析用算术强度判断任务是受计算吞吐还是内存带宽限制。优化的核心原则是少搬数据：
+
+![内存与计算单元之间由有限带宽连接的数据搬运示意图](/posts/cs336-lecture-01-overview-tokenization/compute-memory.png)
+
+*图：计算单元再快，也要等待参数和激活从内存送达；这条窄通道正是许多算子的实际瓶颈。来源：[Stanford CS336 第一讲讲义](https://cs336.stanford.edu/lectures/?trace=lecture_01)。*
 
 - 用算子融合把多次“读—算—写”压成一次数据往返；
 - 用 tiling 让数据块留在更快的片上存储中，FlashAttention 是代表性案例；
@@ -122,6 +134,10 @@ CS336 将从头训练语言模型拆成五个相互咬合的模块：
 完整规模上的超参数搜索过于昂贵。课程把问题从“为一个模型找参数”改写为构造 **scaling recipe**：给定 FLOPs，输出模型规模、数据量和其他超参数。
 
 具体做法是在多个较小预算上运行实验、拟合损失曲线，再外推目标规模。ISOFLOP 曲线则在每个固定计算预算下寻找最优参数量。这里最关键的判断是：**可预测性至少和单点最优同样重要**；如果小实验不能稳定预测大实验，就无法放心投入昂贵训练。第三次作业会提供一个“超参数到损失”的训练接口，要求收集数据点、拟合规律，并提交外推的超参数和损失预测。
+
+![Chinchilla 的 ISOFLOP 曲线，以及由较小计算预算外推参数量和训练 token 数的缩放关系](/posts/cs336-lecture-01-overview-tokenization/chinchilla-isoflop.png)
+
+*图：左侧先在每个固定 FLOPs 预算下寻找损失最低点，中、右两图再把这些最优点拟合成参数量和训练 token 数的缩放规律。来源：[Stanford CS336 第一讲讲义](https://cs336.stanford.edu/lectures/?trace=lecture_01)。*
 
 ### 4. 数据：先定义能力，再决定训练什么
 
@@ -167,6 +183,10 @@ $$
 
 推理阶段也有两种不同瓶颈：处理整段输入的 **prefill** 通常更偏计算密集，而逐 token 生成的 **decode** 往往更受内存带宽限制。量化、蒸馏、推测解码、连续批处理等技术，都是在针对不同瓶颈重新安排资源。推测解码的关键是让便宜的草稿模型先提出多个候选，再由完整模型并行验证；校正正确时，它提升速度但不改变目标模型的采样分布。
 
+![语言模型推理中的 prefill 与逐 token decode 两个阶段，以及贯穿两阶段的 KV cache](/posts/cs336-lecture-01-overview-tokenization/prefill-decode.png)
+
+*图：prefill 可以并行处理整段输入，decode 则依赖已经生成的 token 逐步推进；KV cache 避免每一步重复计算过去的键和值。来源：[Stanford CS336 第一讲讲义](https://cs336.stanford.edu/lectures/?trace=lecture_01)。*
+
 ## 分词究竟在做什么
 
 语言模型不能直接接收字符串。Tokenizer 需要完成双向映射：
@@ -187,6 +207,10 @@ $$
 1. 给所有输入提供稳定的整数表示；
 2. 压缩序列，让模型少走一些时间步；
 3. 决定模型在哪些文本片段上分配独立的嵌入和预测能力。
+
+![把 Stanford was founded in 1885 这句话编码成带有不同文本片段边界的 token ID，并能解码回原文](/posts/cs336-lecture-01-overview-tokenization/tokenized-example.png)
+
+*图：tokenizer 的 encode 把文本切成 token 并映射为整数，decode 再把整数序列无损还原为文本。来源：[Stanford CS336 第一讲讲义](https://cs336.stanford.edu/lectures/?trace=lecture_01)。*
 
 观察现成 tokenizer 时，会看到一些不太像“词”的现象：词前空格可能属于 token；同一个词出现在词首和词中可能被切成不同形式；长数字也常被分成几位一组。这提醒我们，token 是由训练数据和算法共同学到的计算单元，不等同于语言学意义上的单词。
 

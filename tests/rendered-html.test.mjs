@@ -106,6 +106,12 @@ test("CS336 第一讲笔记包含课程主线、BPE 实现和官方资料", asyn
   assert.match(html, /Foundation Models and Fair Use/);
   assert.match(html, /assignment5-alignment/);
   assert.match(html, /更新于.*2026年8月14日/);
+  assert.match(html, /\/posts\/cs336-lecture-01-overview-tokenization\/wei-emergence-plot\.png/);
+  assert.match(html, /\/posts\/cs336-lecture-01-overview-tokenization\/transformer-architecture\.png/);
+  assert.match(html, /\/posts\/cs336-lecture-01-overview-tokenization\/compute-memory\.png/);
+  assert.match(html, /\/posts\/cs336-lecture-01-overview-tokenization\/chinchilla-isoflop\.png/);
+  assert.match(html, /\/posts\/cs336-lecture-01-overview-tokenization\/prefill-decode\.png/);
+  assert.match(html, /\/posts\/cs336-lecture-01-overview-tokenization\/tokenized-example\.png/);
   assert.match(html, /cs336\.stanford\.edu\/lectures\/\?trace=lecture_01/);
   assert.match(html, /github\.com\/stanford-cs336\/assignment1-basics/);
 });
