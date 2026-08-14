@@ -1,0 +1,522 @@
+---
+title: "Karpathy Tokenizer 视频笔记：从 UTF-8 到 GPT-4 BPE"
+description: "系统整理 Karpathy 的两小时 tokenizer 课程：从 Unicode 与 UTF-8 出发，亲手实现 BPE，并理解正则预分词、特殊 token、tiktoken、SentencePiece 与常见陷阱。"
+publishedAt: "2026-08-15"
+category: "技术"
+tags:
+  - "大语言模型"
+  - "Tokenizer"
+  - "BPE"
+  - "Karpathy"
+featured: false
+draft: false
+---
+
+这篇笔记对应 Andrej Karpathy 的视频 [Let's build the GPT Tokenizer](https://www.youtube.com/watch?v=zduSFxRajkE)。视频用两个多小时从字符级编码一路推到 GPT 风格的 byte-level BPE，并反复强调一个容易被忽略的事实：**tokenizer 不是无关紧要的文本预处理，而是语言模型实际看见世界的接口。**
+
+我对照了视频自动字幕、你提供的[视频 Colab 与 BPE 训练单元格](https://colab.research.google.com/drive/1y0KnCFZvGVf_odSfcNAws6kcDD7HsI0L?usp=sharing#scrollTo=eiuP-jzlOhvk)、官方 [minbpe](https://github.com/karpathy/minbpe) 实现、[配套练习](https://github.com/karpathy/minbpe/blob/master/exercise.md)和 Karpathy 的[文字讲义](https://github.com/karpathy/minbpe/blob/master/lecture.md)。本文不是逐字转写，而是把概念、实现和工程陷阱重新组织成一条可以复习和动手验证的路线。
+
+如果想先建立课程全景和分词在训练系统中的位置，可以先读本站的 [CS336 第一讲笔记](/posts/cs336-lecture-01-overview-tokenization)；本文则继续向下钻到实现细节。
+
+## 一页总结
+
+如果只记住这节课的十件事，我会选择下面这些：
+
+1. **语言模型接收的是 token ID，不是 Python 字符串。** ID 会索引 embedding，随后才进入 Transformer。
+2. **UTF-8 解决覆盖问题，BPE 解决序列过长问题。** 256 个原始字节可以表示任意文本，但直接使用会让序列太长。
+3. **训练 tokenizer，就是反复合并语料中最高频的相邻 token pair。** 每次合并都会创造一个新 token。
+4. **编码不是在新文本上重新训练。** 编码只能应用已学到的 merges，而且必须优先执行 rank 更小、训练得更早的规则。
+5. **解码可以从 merge 表重建词表。** 但任意 token 序列未必构成合法 UTF-8，因此常用替换字符处理错误。
+6. **GPT tokenizer 会先用正则切块，再在块内运行 BPE。** 这能禁止字母、数字、标点等类别之间出现不合理合并。
+7. **特殊 token 不属于普通 BPE。** 它们由额外逻辑识别，错误地允许用户输入触发特殊 token 会成为安全隐患。
+8. **词表越大并非越好。** 它会缩短序列，却扩大 embedding 与输出层，并让稀有 token 更难训练充分。
+9. **很多模型怪癖来自 token 边界。** 拼写、反转字符串、算术、多语言、代码缩进和尾随空格都会受影响。
+10. **tokenizer 与语言模型是两个独立训练阶段。** 二者数据分布不匹配，甚至可能产生几乎没有被训练过的“死 token”。
+
+## 视频路线图
+
+| 时间 | 主题 | 应该带走的问题 |
+| --- | --- | --- |
+| [00:00](https://www.youtube.com/watch?v=zduSFxRajkE&t=0s) | 为什么需要理解 tokenizer | 哪些模型怪癖其实不是 Transformer 的错 |
+| [05:50](https://www.youtube.com/watch?v=zduSFxRajkE&t=350s) | 可视化观察 token | 空格、数字、语言和代码怎样改变切分 |
+| [14:56](https://www.youtube.com/watch?v=zduSFxRajkE&t=896s) | Unicode code point | Python 字符串究竟保存什么 |
+| [18:15](https://www.youtube.com/watch?v=zduSFxRajkE&t=1095s) | UTF-8、UTF-16、UTF-32 | 为什么最终从 UTF-8 字节出发 |
+| [23:50](https://www.youtube.com/watch?v=zduSFxRajkE&t=1430s) | BPE 算法 | 如何用更大的词表换取更短的序列 |
+| [27:02](https://www.youtube.com/watch?v=zduSFxRajkE&t=1622s) | 从零实现 | pair 计数、替换、训练、编码和解码 |
+| [57:36](https://www.youtube.com/watch?v=zduSFxRajkE&t=3456s) | 正则预分词 | 为什么 GPT 不直接对整段字节运行 BPE |
+| [1:11:38](https://www.youtube.com/watch?v=zduSFxRajkE&t=4298s) | tiktoken 与 GPT-2 源码 | 现代实现比基础 BPE 多了什么 |
+| [1:18:26](https://www.youtube.com/watch?v=zduSFxRajkE&t=4706s) | 特殊 token | 文档边界、聊天模板和安全边界如何表达 |
+| [1:28:42](https://www.youtube.com/watch?v=zduSFxRajkE&t=5322s) | SentencePiece | 另一条主流路线如何处理 code point 与未知字符 |
+| [1:43:27](https://www.youtube.com/watch?v=zduSFxRajkE&t=6207s) | 词表大小与模型 surgery | 为什么增加 token 也要修改模型参数 |
+| [1:51:41](https://www.youtube.com/watch?v=zduSFxRajkE&t=6701s) | 重新解释模型怪癖 | token 边界怎样影响能力、成本与安全 |
+
+## 先建立正确的心智模型
+
+完整的数据路径可以写成：
+
+$$
+\text{文本}
+\rightarrow \text{Unicode code points}
+\xrightarrow{\mathrm{UTF\text{-}8} }\text{字节}
+\rightarrow \text{正则切块}
+\xrightarrow{\mathrm{BPE}}\text{token IDs}
+\rightarrow \text{embeddings}
+\rightarrow \text{Transformer}.
+$$
+
+反方向则是：
+
+$$
+\text{token IDs}
+\rightarrow \text{字节片段}
+\rightarrow \text{UTF-8 字节流}
+\rightarrow \text{文本}.
+$$
+
+这张链路里有两个不同的训练过程：
+
+- **tokenizer 训练**从一份代表性语料中学习 merge 规则；
+- **语言模型训练**把已经固定的 token ID 当作训练数据，更新神经网络参数。
+
+因此，更换 tokenizer 并不等于换一个输入函数。模型的 embedding 行数、输出分类维度、训练序列和参数含义都会随之改变。通常应在语言模型训练前冻结 tokenizer。
+
+## 为什么不直接使用字符或 Unicode code point
+
+最简单的字符级 tokenizer 可以给训练集中每个字符分配一个整数：
+
+```python
+chars = sorted(set(text))
+stoi = {ch: i for i, ch in enumerate(chars)}
+itos = {i: ch for ch, i in stoi.items()}
+
+def encode_chars(value: str) -> list[int]:
+    return [stoi[ch] for ch in value]
+
+def decode_chars(ids: list[int]) -> str:
+    return "".join(itos[i] for i in ids)
+```
+
+它适合教学，却有两个明显问题：
+
+1. 词表只覆盖训练语料出现过的字符，新字符无法表示；
+2. 一个字符占一个时间步，模型需要用很长的序列表达常见单词和片段。
+
+Python 的 `str` 本质上是 Unicode code point 序列，`ord("A")` 能得到单个字符的 code point。但直接把所有 code point 当词表也不理想：Unicode 包含大量字符，标准仍会演进，而且高频与低频字符得到相同粒度的计算。
+
+### 为什么选择 UTF-8
+
+UTF-8 把每个 code point 编码成 1 到 4 个字节。它有三个适合作为基础层的性质：
+
+- 字节值只在 0 到 255 之间，基础词表固定为 256；
+- 任意 Unicode 文本都能转成字节，不需要未知字符；
+- ASCII 文本与 UTF-8 兼容，英文不会充满无用的零字节。
+
+```python
+text = "Hello, 世界 👋"
+raw = text.encode("utf-8")
+ids = list(raw)
+
+assert bytes(ids).decode("utf-8") == text
+```
+
+但只使用 256 个字节 token 会把文本展开成很长的序列。BPE 的角色就是：保留字节级的完整覆盖能力，同时把高频字节片段逐步压缩成更大的 token。
+
+## Byte Pair Encoding：用词表换序列长度
+
+BPE 的训练循环非常朴素：
+
+1. 统计序列中所有相邻 pair 的频次；
+2. 找到频次最高的 pair；
+3. 为它分配一个新 token ID；
+4. 把这个 pair 的所有非重叠出现替换成新 ID；
+5. 重复，直到词表达到目标大小。
+
+以 `aaabdaaabac` 为例，基础字节 token 中 `a=97`、`b=98`、`c=99`、`d=100`。进行三次合并：
+
+| 次序 | 合并规则 | 新 token 表示 |
+| --- | --- | --- |
+| 1 | `(97, 97) -> 256` | `aa` |
+| 2 | `(97, 98) -> 257` | `ab` |
+| 3 | `(256, 257) -> 258` | `aaab` |
+
+最终编码为 `[258, 100, 258, 97, 99]`。词表从 256 增长到 259，序列则从 11 个字节缩短到 5 个 token。
+
+### 两个基础函数
+
+```python
+from collections import Counter
+
+def pair_counts(ids: list[int]) -> Counter[tuple[int, int]]:
+    return Counter(zip(ids, ids[1:]))
+
+def merge_pair(
+    ids: list[int],
+    pair: tuple[int, int],
+    new_id: int,
+) -> list[int]:
+    out: list[int] = []
+    i = 0
+    while i < len(ids):
+        if i + 1 < len(ids) and (ids[i], ids[i + 1]) == pair:
+            out.append(new_id)
+            i += 2
+        else:
+            out.append(ids[i])
+            i += 1
+    return out
+```
+
+这里必须是**非重叠替换**。例如三个连续的 `a` 中，第一个 `aa` 合并后，第三个 `a` 仍然保留；不能让同一个位置同时参加两次 merge。
+
+### 训练一个最小 BPE
+
+你给出的 [Colab 单元格](https://colab.research.google.com/drive/1y0KnCFZvGVf_odSfcNAws6kcDD7HsI0L?usp=sharing#scrollTo=eiuP-jzlOhvk)正好包含视频现场写出的 `get_stats`、`merge` 与完整训练循环。下面把函数重命名为前文的 `pair_counts`、`merge_pair`，并补上边界检查；算法和该单元格一致。
+
+```python
+def train_bpe(text: str, vocab_size: int) -> dict[tuple[int, int], int]:
+    if vocab_size < 256:
+        raise ValueError("vocab_size 至少为 256")
+
+    ids = list(text.encode("utf-8"))
+    merges: dict[tuple[int, int], int] = {}
+
+    for new_id in range(256, vocab_size):
+        counts = pair_counts(ids)
+        if not counts:
+            break
+        pair = max(counts, key=counts.get)
+        ids = merge_pair(ids, pair, new_id)
+        merges[pair] = new_id
+
+    return merges
+```
+
+训练前的字节数与训练后的 token 数之比可以作为直观压缩率：
+
+$$
+\text{compression ratio}
+=
+\frac{\text{UTF-8 字节数}}{\text{BPE token 数}}.
+$$
+
+压缩率不是唯一目标。极端追求压缩会让词表和模型输出层过大，也可能把过多信息塞入一次 Transformer 时间步。
+
+## 编码最容易写错的地方：使用 merge rank
+
+训练阶段选择当前语料里**最高频**的 pair；编码阶段却不能在待编码文本中重新找最高频 pair。编码必须重放已经学到的规则，并优先应用更早学到的 merge。
+
+在上面的字典中，新 ID 同时可以充当 merge rank：ID 越小，规则越早学到，优先级越高。
+
+```python
+def encode(text: str, merges: dict[tuple[int, int], int]) -> list[int]:
+    ids = list(text.encode("utf-8"))
+
+    while len(ids) >= 2:
+        candidates = pair_counts(ids)
+        pair = min(
+            candidates,
+            key=lambda p: merges.get(p, float("inf")),
+        )
+        if pair not in merges:
+            break
+        ids = merge_pair(ids, pair, merges[pair])
+
+    return ids
+```
+
+这里的 `pair_counts` 只是枚举当前存在哪些相邻 pair；它的频次不参与优先级判断。真正的优先级来自 `merges` 中保存的 rank。
+
+## 解码：从 merge 表重建词表
+
+基础词表把 0 到 255 映射到单字节。每个新 token 都等于两个子 token 的字节串拼接，因此可以按 merge 顺序重建：
+
+```python
+def build_vocab(
+    merges: dict[tuple[int, int], int],
+) -> dict[int, bytes]:
+    vocab = {i: bytes([i]) for i in range(256)}
+    for (left, right), new_id in merges.items():
+        vocab[new_id] = vocab[left] + vocab[right]
+    return vocab
+
+def decode(ids: list[int], vocab: dict[int, bytes]) -> str:
+    raw = b"".join(vocab[i] for i in ids)
+    return raw.decode("utf-8", errors="replace")
+```
+
+应该持续验证：
+
+$$
+\operatorname{decode}(\operatorname{encode}(x))=x.
+$$
+
+反过来却不成立：任意 token ID 序列不保证能拼成合法 UTF-8。模型可能在生成过程中输出不完整的多字节字符，因此解码通常用 `errors="replace"` 产生替换字符，而不是让整个请求报错。
+
+## tokenizer 是独立的数据工程项目
+
+Karpathy 在 [39:20](https://www.youtube.com/watch?v=zduSFxRajkE&t=2360s) 特别画图强调：tokenizer 与 Transformer 是两个独立对象。
+
+tokenizer 的训练语料决定计算资源怎样分配：
+
+- 英文占比高，会学到更多英文长片段；
+- 中文、日文或韩文不足，同样语义会被拆成更多 token；
+- 代码不足，缩进、运算符和常见语法可能得到低效表示；
+- 某个域数据过多，会占用大量只服务于该域的 token。
+
+这意味着 tokenizer 数据集不一定要和语言模型数据集完全相同，但二者必须足够一致。否则可能出现：某个字符串在 tokenizer 语料中频繁到拥有专属 token，却在语言模型训练语料中几乎不出现，使对应 embedding 长期得不到更新。
+
+## 为什么 GPT 还需要正则预分词
+
+最基础的 BPE 会跨任意边界合并。高频的 `dog.`、`dog!`、`dog?` 可能各自占用词表，语义主体和标点被不必要地捆绑。
+
+GPT 风格 tokenizer 会先按类别切块：
+
+```python
+import regex as re
+
+GPT4_SPLIT_PATTERN = (
+    r"'(?i:[sdmt]|ll|ve|re)"
+    r"|[^\r\n\p{L}\p{N}]?+\p{L}+"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]++[\r\n]*"
+    r"|\s*[\r\n]"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
+chunks = re.findall(GPT4_SPLIT_PATTERN, text)
+```
+
+之后每个 chunk 独立运行 BPE，结果再拼接。于是 merge 无法跨 chunk 边界发生。
+
+这段正则的意图比语法更重要：
+
+- 常见英文缩写后缀单独处理；
+- 字母、数字、标点和空白大体分开；
+- GPT-4 模式对缩写采用不区分大小写匹配；
+- 数字按 1 到 3 位成组，避免合并出无限增长的长数字 token；
+- 换行与尾随空白有专门分支。
+
+GPT-2 发布了 tokenizer 的**推理代码**，却没有公开 tokenizer 的完整训练过程。因此可以理解它怎样应用 merges，却不能从推理代码断言训练时只做了“正则切块加普通 BPE”。视频也用连续空格没有被 GPT-2 合并的现象说明，其中还存在未公开或历史遗留的规则。
+
+## tiktoken、minbpe 与 GPT-4 兼容层
+
+[tiktoken](https://github.com/openai/tiktoken) 是 OpenAI 的高性能 tokenizer 库，适合加载已有编码并执行 encode/decode。Karpathy 的 [minbpe](https://github.com/karpathy/minbpe) 则把学习路径拆成三个层次：
+
+| 实现 | 作用 |
+| --- | --- |
+| `BasicTokenizer` | 直接在整段 UTF-8 字节上训练和应用 BPE |
+| `RegexTokenizer` | 增加正则预分词和特殊 token |
+| `GPT4Tokenizer` | 加载 `cl100k_base`，复现 GPT-4 tokenizer 行为 |
+
+GPT-4 兼容层有两个不直观的细节：
+
+1. `tiktoken` 暴露的是 token 字节串与 rank，需要从这些结果恢复原始二叉 merge 关系；
+2. 前 256 个单字节 token 存在历史性的 ID 排列，需要在编码时 shuffle、解码时 inverse shuffle。
+
+所以“算法与 GPT-4 一致”和“token ID 与 GPT-4 完全一致”是两个不同目标。前者只需正确实现 byte-level BPE；后者还要复制正则、merge ranks、特殊 token 和字节排列。
+
+## 特殊 token：不属于普通 BPE 的控制通道
+
+GPT-2 的词表大小 50,257 可以拆成：
+
+$$
+256\ \text{个字节 token}
++ 50{,}000\ \text{次 merge}
++ 1\ \text{个特殊 token}.
+$$
+
+最后一个就是 `<|endoftext|>`，用于分隔原本无关的文档。聊天模型还会用更多特殊 token 表示消息开始、结束、角色或工具调用。
+
+特殊 token 通常由额外逻辑直接识别，而不是靠 BPE 自然合并出来：
+
+```python
+special_tokens = {
+    "<|endoftext|>": 100257,
+}
+```
+
+这里有两个工程风险：
+
+- **输入安全**：如果把用户文本作为 `allowed_special="all"` 编码，攻击者可能注入模型控制边界；
+- **模型一致性**：新增 token 后必须扩展输入 embedding 和最终 LM head，并训练新参数；只改 tokenizer 文件会让模型维度或语义失配。
+
+因此，普通用户文本默认应按普通文本编码。只有应用自己插入的受信控制标记，才应被允许解析为特殊 token。
+
+## SentencePiece 是另一种路线
+
+视频以 Llama 2 使用的配置为例介绍 [SentencePiece](https://github.com/google/sentencepiece)。它与 byte-level minbpe 的关键区别不是 API，而是运算顺序：
+
+| 维度 | GPT 风格 byte-level BPE | 视频中的 SentencePiece BPE |
+| --- | --- | --- |
+| 初始单位 | UTF-8 的 256 个字节 | 训练语料中的 Unicode code point |
+| 未见字符 | 天然可由字节表示 | 映射到 `unk`，或启用 byte fallback |
+| 预处理 | 正则切块 | 大量可配置的 normalization、空白和数字规则 |
+| 训练 | minbpe 可训练，tiktoken 主要用于推理 | 原生支持高效训练与推理 |
+| 空格处理 | 空格常成为后续片段的前缀 | 可加入 dummy prefix，并用专门符号表示空格 |
+
+若关闭 byte fallback，训练时没出现的字符可能全部坍缩成同一个 `unk`，模型无法区分它们。启用 fallback 后，稀有 code point 会退回 UTF-8 字节 token，覆盖性更可靠。
+
+SentencePiece 功能强、应用广，但配置很多。对于语言模型，尤其要检查：
+
+- 是否无意中做了大小写、空白或 Unicode normalization；
+- “句子”长度限制有没有截断训练数据；
+- `character_coverage` 是否丢掉了需要支持的字符；
+- byte fallback、数字切分和 dummy prefix 是否符合目标模型。
+
+不要只复制 `vocab_size`；训练参数本身也是 tokenizer 定义的一部分。
+
+Colab 的最终建议还列出了 [Hugging Face Tokenizers](https://huggingface.co/docs/transformers/main_classes/tokenizer) 作为实践中值得评估的方案。视频没有展开其内部算法，因此本文也不把它简单等同于 SentencePiece。
+
+## 词表大小到底怎样选
+
+扩大词表有明确收益：同一文本需要的 token 更少，有限上下文能覆盖更多原始内容。但代价也同样明确。
+
+在 Transformer 中，词表大小 $V$ 至少直接影响两处：
+
+1. 输入 embedding 大约包含 $V\times d_{\text{model}}$ 个参数；
+2. 输出 LM head 需要为每个位置计算 $V$ 个 logits。
+
+词表太大还会导致：
+
+- 每个 token 出现得更少，对应向量可能训练不足；
+- 大片字符被压成单 token，模型在同样原始文本上获得的计算步数减少；
+- 训练和推理的输出投影更昂贵；
+- 词表被大量狭窄领域片段占据。
+
+因此它是需要通过数据和下游指标选择的超参数。视频给出的经验范围是数万到约十万，但这不是脱离语言、数据、模型大小和服务成本的固定答案。
+
+### 在预训练模型上增加 token
+
+增加 token 需要同时：
+
+- 为输入 embedding 增加新行；
+- 为输出层增加对应分类权重；
+- 初始化并训练这些新参数；
+- 明确旧参数是冻结、部分更新还是共同微调。
+
+视频还提到一种更激进的用途：训练少量新 embedding，让几个“gist token”近似替代一段很长的提示。这说明 token 不只是在压缩字符串，也可以成为可学习的控制或压缩接口。
+
+## 多模态也可以看作 tokenization
+
+图片、音频和视频不一定要求推翻 Transformer。常见思路是先通过 patch、向量量化或编码器把连续信号变成一串表示，再交给统一的序列模型。
+
+这些表示可以是：
+
+- **离散 token**：从有限码本选择整数，适合自回归建模；
+- **连续或软 token**：通过信息瓶颈得到向量，再由 Transformer 或扩散模型处理。
+
+因此，文本 tokenizer 的核心问题会在多模态中再次出现：怎样选择原子、怎样控制序列长度、怎样避免丢失信息，以及怎样让表示和训练数据匹配。
+
+## 用 token 边界解释模型怪癖
+
+### 拼写与反转字符串
+
+如果 `defaultStyle` 整体是一个 token，模型输入里没有逐字符边界。要求它数某个字母或直接反转字符串，相当于从一个 embedding 中恢复内部拼写。先让模型把字符用空格展开，再操作列表，往往会更容易，因为字符边界重新出现在 token 序列中。
+
+### 非英语语言
+
+同一句话在低资源语言中可能变成更多 token。这会同时带来：
+
+- 更快耗尽上下文；
+- 更高推理费用；
+- 更长的注意力路径；
+- 每个语义片段获得更少的有效建模容量。
+
+这不仅取决于语言模型训练数据，也取决于 tokenizer 的训练混合。
+
+### 算术
+
+竖式加法天然按个位、十位、百位工作，但 BPE 可能把数字任意切成一位、两位或三位片段。模型必须先从不规则 token 恢复数位结构，再学习算法。GPT-4 正则限制数字 chunk 长度，SentencePiece 也可以显式按位切分；这些选择都会改变算术难度。
+
+### Python 缩进
+
+GPT-2 会把连续空格切成许多独立 token，代码很快占满上下文。较新的 tokenizer 会合并常见空白长度，因此代码能力的进步不只来自模型和数据，也来自输入表示更高效。
+
+### 尾随空格与 unstable token
+
+许多 GPT token 把前导空格和单词合在一起。若调用者先在 prompt 末尾塞入一个独立空格，就可能人为切断原本应是一个整体的下一个 token，使输入落到训练中少见的边界上。
+
+类似地，若 prompt 停在某个长 token 的中间字符位置，简单地“在当前 token 列表后追加下一个 token”并不等价于字符级补全。这就是 completion API 中 unstable token 处理复杂的根源。
+
+### `SolidGoldMagikarp` 与数据集错配
+
+视频给出的解释是：某些字符串可能在 tokenizer 训练集里非常高频，因而获得专属 token；但它们在语言模型训练集中几乎不存在，对应 embedding 没有被充分更新。推理时突然输入这种 token，就像把接近随机初始化的向量送进模型，行为可能非常异常。
+
+这个案例提醒我们：tokenizer 与模型语料可以不同，但必须审计每个 token 在模型训练数据中的覆盖率，尤其是非常具体的人名、用户名和域内字符串。
+
+### YAML 一定比 JSON 更好吗
+
+视频示例中，同一结构的 YAML token 数少于 JSON，因为标点和引号更少。但这不是普遍定律：结果取决于 tokenizer、字段名、空白和实际内容。
+
+更稳妥的规则是：**用目标模型的 tokenizer 实测格式成本，同时权衡解析稳定性和安全性。** 不要仅凭文件体积或经验猜测 token 数。
+
+## 一份更接近生产的检查清单
+
+训练或接入 tokenizer 时，至少验证下面这些项目：
+
+1. **往返不变性**：多语言、emoji、组合字符和控制字符都满足 decode/encode 往返；
+2. **空输入与单字节输入**：编码循环不能因为没有 pair 而报错；
+3. **merge 顺序**：编码按 rank，而不是按新文本中的频率；
+4. **跨类别边界**：正则 chunk 之间绝不发生 merge；
+5. **特殊 token 权限**：普通用户输入默认不能激活控制 token；
+6. **未知字符策略**：SentencePiece 的 `unk` 与 byte fallback 必须显式测试；
+7. **多语言压缩率**：分别统计各语言、代码和结构化格式的 bytes/token；
+8. **token 覆盖率**：检查词表 token 在语言模型语料中的出现次数，发现死 token；
+9. **可复现保存**：模型文件必须保存正则、merges、特殊 token 和必要的字节映射；
+10. **兼容性测试**：若目标是复现 `tiktoken`，逐例比较 token IDs 和解码结果。
+
+## 跟着视频动手的五步路线
+
+Karpathy 的[官方练习](https://github.com/karpathy/minbpe/blob/master/exercise.md)给出了一条很好的渐进路线：
+
+1. 实现 `BasicTokenizer.train/encode/decode`，先在小语料上观察 merges；
+2. 加入 GPT-4 正则，确保字母、数字、标点和空白不会跨类别合并；
+3. 从 `cl100k_base` 恢复 merge 关系，处理 byte shuffle，与 `tiktoken` 对齐；
+4. 加入特殊 token 和 `allowed_special` 策略；
+5. 研究 SentencePiece，把 code point BPE、`unk` 和 byte fallback 做成对照实验。
+
+建议不要一开始照抄完整实现。先只写 `pair_counts` 和 `merge_pair`，在 `aaabdaaabac` 上打印每一步；再实现训练、编码和解码。最后才加入正则和 GPT-4 兼容细节。这样每一层错误都能被单独定位。
+
+可以用下面的最小测试集合守住核心性质：
+
+```python
+samples = [
+    "",
+    "hello world",
+    "你好，世界",
+    "안녕하세요",
+    "👩‍💻 café",
+    "def f():\n    return 42\n",
+]
+
+for sample in samples:
+    assert decode(encode(sample, merges), vocab) == sample
+```
+
+若要直接阅读成品，`minbpe/base.py` 适合看公共数据结构，`basic.py` 适合看最小 BPE，`regex.py` 适合看预分词和特殊 token，`gpt4.py` 则集中展示 merge 恢复与 byte shuffle。
+
+## 我的理解
+
+这节课最重要的价值，不是记住一段 BPE 代码，而是改变我们看待 token 的方式。
+
+token 不是自然语言中客观存在的“词”，而是**由数据分布、压缩目标和工程规则共同设计出的计算单位**。它决定模型一次前向传播覆盖多少原始文本，也决定哪些模式更容易学习、哪些语言更昂贵、哪些字符级任务更别扭。
+
+理想的 tokenizer 需要同时满足四件事：
+
+- 任意输入都能表示；
+- 序列足够短；
+- 边界对任务友好；
+- 训练与推理规则完全可复现。
+
+BPE 是目前很实用的折中，却不是终点。Karpathy 最后对 tokenizer-free 模型的期待也很有道理：如果模型能直接在字节上进行自适应分块和分层计算，就有机会把今天这套独立、脆弱又充满历史细节的接口真正删掉。
+
+## 参考资料
+
+- [Karpathy：Let's build the GPT Tokenizer](https://www.youtube.com/watch?v=zduSFxRajkE)
+- [karpathy/minbpe](https://github.com/karpathy/minbpe)
+- [minbpe 配套练习](https://github.com/karpathy/minbpe/blob/master/exercise.md)
+- [视频 Colab：BPE 训练循环单元格](https://colab.research.google.com/drive/1y0KnCFZvGVf_odSfcNAws6kcDD7HsI0L?usp=sharing#scrollTo=eiuP-jzlOhvk)
+- [OpenAI tiktoken](https://github.com/openai/tiktoken)
+- [Google SentencePiece](https://github.com/google/sentencepiece)
+- [GPT-2：Language Models are Unsupervised Multitask Learners](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf)

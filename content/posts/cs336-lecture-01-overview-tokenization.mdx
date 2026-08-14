@@ -2,7 +2,7 @@
 title: "CS336 第一讲笔记：从课程全景到 BPE 分词"
 description: "梳理 Stanford CS336 第一讲的课程主线、效率视角与分词基础，并从字节出发推导 BPE 的训练过程。"
 publishedAt: "2026-08-13"
-updatedAt: "2026-08-14"
+updatedAt: "2026-08-15"
 category: "技术"
 tags:
   - "CS336"
@@ -352,7 +352,7 @@ def decode(token_ids: list[int], vocab: dict[int, bytes]) -> str:
 
 字节级初始化解决了未知字符问题，却不自动解决特殊 token、边界和速度问题。一个“算法上正确”的 BPE 与一个“训练中可用”的 tokenizer，中间仍隔着完整的工程实现。
 
-若希望跟着视频再实现一遍，讲义特别推荐 Andrej Karpathy 的 [Let's build the GPT Tokenizer](https://www.youtube.com/watch?v=zduSFxRajkE)。`tiktoken` 仓库也提供 `tiktoken._educational` 模块，可以训练一个小型 BPE 并逐步显示合并过程，适合用来核对自己的实现。
+若希望跟着视频再实现一遍，讲义特别推荐 Andrej Karpathy 的 [Let's build the GPT Tokenizer](https://www.youtube.com/watch?v=zduSFxRajkE)；本站也整理了[完整中文笔记与实现路线](/posts/karpathy-build-gpt-tokenizer)。`tiktoken` 仓库还提供 `tiktoken._educational` 模块，可以训练一个小型 BPE 并逐步显示合并过程，适合用来核对自己的实现。
 
 ## 讲义链接延伸：真的可以不要 tokenizer 吗
 

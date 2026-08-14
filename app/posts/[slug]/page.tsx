@@ -1,9 +1,10 @@
 import type { Metadata } from "next";
+import { headers } from "next/headers";
 import Link from "@/components/site-link";
 import { notFound } from "next/navigation";
 import { CodeCopyButtons } from "@/components/code-copy";
 import { getAllPosts, getPostBySlug } from "@/lib/posts";
-import { formatDate } from "@/lib/site";
+import { formatDate, requestOrigin } from "@/lib/site";
 
 type PageProps = { params: Promise<{ slug: string }> };
 
@@ -16,24 +17,31 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
   const post = getPostBySlug(slug);
   if (!post) return { title: "文章不存在" };
 
+  const origin = requestOrigin(await headers());
+  const canonical = new URL(`/posts/${post.slug}`, origin).toString();
+  const socialImage = post.cover ? new URL(post.cover, origin).toString() : null;
+
   return {
     title: post.title,
     description: post.description,
-    alternates: { canonical: `/posts/${post.slug}` },
+    alternates: { canonical },
     openGraph: {
       type: "article",
+      url: canonical,
       title: post.title,
       description: post.description,
       publishedTime: `${post.publishedAt}T00:00:00.000Z`,
       modifiedTime: post.updatedAt ? `${post.updatedAt}T00:00:00.000Z` : undefined,
       tags: post.tags,
-      images: [{ url: "/og.png", alt: `${post.title}｜Kamito's Notes` }],
+      images: socialImage
+        ? [{ url: socialImage, alt: `${post.title}｜Kamito's Notes` }]
+        : [],
     },
     twitter: {
-      card: "summary_large_image",
+      card: socialImage ? "summary_large_image" : "summary",
       title: post.title,
       description: post.description,
-      images: ["/og.png"],
+      images: socialImage ? [socialImage] : [],
     },
   };
 }

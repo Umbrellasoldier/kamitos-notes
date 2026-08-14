@@ -68,6 +68,7 @@ test("主要页面和聚合页均可渲染", async () => {
     "/posts/fundamental-data-structures",
     "/posts/python-competitive-template",
     "/posts/cs336-lecture-01-overview-tokenization",
+    "/posts/karpathy-build-gpt-tokenizer",
     "/about",
     "/categories",
     "/categories/%E6%8A%80%E6%9C%AF",
@@ -105,7 +106,7 @@ test("CS336 第一讲笔记包含课程主线、BPE 实现和官方资料", asyn
   assert.match(html, /Byte Latent Transformer/);
   assert.match(html, /Foundation Models and Fair Use/);
   assert.match(html, /assignment5-alignment/);
-  assert.match(html, /更新于.*2026年8月14日/);
+  assert.match(html, /更新于.*2026年8月15日/);
   assert.match(html, /\/posts\/cs336-lecture-01-overview-tokenization\/wei-emergence-plot\.png/);
   assert.match(html, /\/posts\/cs336-lecture-01-overview-tokenization\/transformer-architecture\.png/);
   assert.match(html, /\/posts\/cs336-lecture-01-overview-tokenization\/compute-memory\.png/);
@@ -114,6 +115,27 @@ test("CS336 第一讲笔记包含课程主线、BPE 实现和官方资料", asyn
   assert.match(html, /\/posts\/cs336-lecture-01-overview-tokenization\/tokenized-example\.png/);
   assert.match(html, /cs336\.stanford\.edu\/lectures\/\?trace=lecture_01/);
   assert.match(html, /github\.com\/stanford-cs336\/assignment1-basics/);
+  assert.match(html, /href="\/posts\/karpathy-build-gpt-tokenizer"/);
+});
+
+test("Karpathy tokenizer 笔记覆盖完整视频主线和可运行实现", async () => {
+  const response = await render("/posts/karpathy-build-gpt-tokenizer");
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /Karpathy Tokenizer 视频笔记：从 UTF-8 到 GPT-4 BPE/);
+  assert.match(html, /class="toc"/);
+  assert.match(html, /class="katex-display"/);
+  assert.match(html, /data-rehype-pretty-code-figure/);
+  assert.match(html, /pair_counts/);
+  assert.match(html, /GPT4_SPLIT_PATTERN/);
+  assert.match(html, /SentencePiece/);
+  assert.match(html, /SolidGoldMagikarp/);
+  assert.match(html, /github\.com\/karpathy\/minbpe/);
+  assert.match(html, /youtube\.com\/watch\?v=zduSFxRajkE/);
+  assert.match(html, /property="og:title" content="Karpathy Tokenizer/);
+  assert.match(html, /name="twitter:card" content="summary"/);
+  assert.doesNotMatch(html, /property="og:image"/);
+  assert.doesNotMatch(html, /name="twitter:image"/);
 });
 
 test("新整理文章保留合并结构、本地图片和代码高亮", async () => {
@@ -151,6 +173,7 @@ test("RSS、站点地图和 robots 只包含已发布内容", async () => {
   assert.match(rssText, /算法竞赛进阶指南/);
   assert.match(rssText, /AtCoder ABC 题解集/);
   assert.match(rssText, /CS336 第一讲笔记/);
+  assert.match(rssText, /Karpathy Tokenizer 视频笔记/);
 
   const sitemap = await render("/sitemap.xml");
   assert.equal(sitemap.status, 200);
@@ -168,6 +191,7 @@ test("RSS、站点地图和 robots 只包含已发布内容", async () => {
   assert.match(sitemapText, /\/posts\/fundamental-data-structures/);
   assert.match(sitemapText, /\/posts\/python-competitive-template/);
   assert.match(sitemapText, /\/posts\/cs336-lecture-01-overview-tokenization/);
+  assert.match(sitemapText, /\/posts\/karpathy-build-gpt-tokenizer/);
   assert.match(sitemapText, /\/categories\/%E6%8A%80%E6%9C%AF/);
   assert.match(sitemapText, /\/categories\/%E9%9A%8F%E7%AC%94/);
 
