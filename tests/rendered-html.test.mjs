@@ -83,6 +83,20 @@ test("主要页面和聚合页均可渲染", async () => {
   }
 });
 
+test("完整头像用于关于页、文章署名和站点图标", async () => {
+  const about = await render("/about");
+  assert.equal(about.status, 200);
+  const aboutHtml = await about.text();
+  assert.match(aboutHtml, /src="\/avatar-kamito-v2\.png"/);
+  assert.match(aboutHtml, /width="1024" height="1024"/);
+
+  const post = await render("/posts/karpathy-build-gpt-tokenizer");
+  assert.equal(post.status, 200);
+  assert.match(await post.text(), /src="\/avatar-kamito-v2\.png"/);
+
+  assert.doesNotMatch(aboutHtml, /src="\/avatar\.png"/);
+});
+
 test("迁移文章保留目录、公式和代码高亮", async () => {
   const response = await render("/posts/greedy-exchange-argument");
   assert.equal(response.status, 200);

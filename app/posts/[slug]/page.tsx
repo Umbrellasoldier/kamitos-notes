@@ -62,7 +62,7 @@ export default async function PostPage({ params }: PageProps) {
           <h1>{post.title}</h1>
           <p className="article-deck">{post.description}</p>
           <div className="article-byline">
-            <img src="/avatar.png" alt="" width="64" height="50" />
+            <img src="/avatar-kamito-v2.png" alt="" width="48" height="48" />
             <div>
               <span>Kamito</span>
               <p>

@@ -12,7 +12,12 @@ export default function AboutPage() {
     <main className="about-shell shell">
       <section className="about-portrait" aria-label="Kamito 的头像">
         <span className="portrait-number">ABOUT / 01</span>
-        <img src="/avatar.png" alt="Kamito 的粉色动漫人物头像" width="858" height="668" />
+        <img
+          src="/avatar-kamito-v2.png"
+          alt="Kamito 的粉发动漫人物头像"
+          width="1024"
+          height="1024"
+        />
       </section>
       <article className="about-copy">
         <p className="eyebrow">NICE TO MEET YOU</p>

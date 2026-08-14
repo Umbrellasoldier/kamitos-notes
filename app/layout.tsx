@@ -48,9 +48,9 @@ export async function generateMetadata(): Promise<Metadata> {
     authors: [{ name: siteConfig.author }],
     creator: siteConfig.author,
     icons: {
-      icon: "/avatar.png",
-      shortcut: "/avatar.png",
-      apple: "/avatar.png",
+      icon: "/avatar-kamito-v2.png",
+      shortcut: "/avatar-kamito-v2.png",
+      apple: "/avatar-kamito-v2.png",
     },
     openGraph: {
       type: "website",

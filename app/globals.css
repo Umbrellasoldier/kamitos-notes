@@ -741,7 +741,7 @@ img {
 
 .article-byline img {
   width: 48px;
-  height: 42px;
+  height: 48px;
   object-fit: contain;
   border: 1px solid var(--line);
   border-radius: 50%;
@@ -1058,11 +1058,10 @@ html[data-theme="dark"] [data-theme*=" "] span {
 }
 
 .about-portrait img {
-  width: 114%;
-  max-width: none;
-  margin-left: -7%;
-  padding-top: 72px;
-  transform: translateY(6%);
+  width: 100%;
+  height: auto;
+  padding: 56px 18px 0;
+  object-fit: contain;
 }
 
 .about-copy {
