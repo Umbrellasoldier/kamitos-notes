@@ -1,0 +1,292 @@
+---
+title: "CS336 train_bpe 实战：从正确实现到 3.5 倍性能优化"
+description: "复盘我实现 byte-level BPE 训练器的过程：预分词、增量 pair 统计、多进程分块、性能分析，以及一个被反复扫描的零计数集合如何成为真正瓶颈。"
+publishedAt: "2026-08-18"
+category: "技术"
+tags:
+  - "CS336"
+  - "Tokenizer"
+  - "BPE"
+  - "Python"
+  - "性能优化"
+featured: false
+draft: false
+---
+
+这篇文章记录我完成 Stanford CS336 Assignment 1 中 `train_bpe` 的过程。它不是一份可以直接提交的完整答案，而是一份实现复盘：我怎样选择数据结构、怎样验证正确性、怎样用 profiling 找到瓶颈，以及为什么一个看起来不起眼的陈旧集合，最后占掉了大部分训练时间。
+
+如果想先理解 tokenizer 在语言模型中的位置，可以从本站的 [CS336 第一讲笔记](/posts/cs336-lecture-01-overview-tokenization) 开始；如果想系统复习 UTF-8、BPE 训练与编码，可以继续阅读 [Karpathy Tokenizer 视频笔记](/posts/karpathy-build-gpt-tokenizer)。本文只聚焦一个更工程化的问题：**怎样把 BPE trainer 写对，并让它在完整 TinyStories 语料上跑得足够快。**
+
+## 结果先行
+
+最终实现通过了 `train_bpe` 的正确性、特殊 token 和速度测试。在词表大小为 10,000、特殊 token 为 `<|endoftext|>` 时：
+
+| 语料 | `train_bpe` 时间 | maximum resident set size | 词表大小 | merge 数量 |
+| --- | ---: | ---: | ---: | ---: |
+| TinyStories validation | 2.541 秒 | 75.36 MiB | 10,000 | 9,743 |
+| TinyStories 完整训练集 | 145.602 秒 | 894.17 MiB | 10,000 | 9,743 |
+
+完整训练集的总墙钟时间为 145.79 秒，约 2 分 26 秒；`user + sys` CPU 时间约为 1,005 秒，除以墙钟时间后相当于平均使用约 6.9 个 CPU 核心。运行过程中没有发生 swap。
+
+merge 数量可以直接检查：基础词表包含 256 个单字节 token，再加入 1 个特殊 token，所以需要
+
+$$
+10000 - 256 - 1 = 9743
+$$
+
+次合并。最终最长的非特殊 token 是 `b' accomplishment'`，长度为 15 bytes。
+
+这组结果不是一次“大改”得到的，而是经过了几轮很具体的测量和修正。
+
+## 先明确训练器应该返回什么
+
+`train_bpe` 的输出有两部分：
+
+```python
+vocab: dict[int, bytes]
+merges: list[tuple[bytes, bytes]]
+```
+
+`vocab` 把整数 token ID 映射到原始字节串；`merges` 按学习顺序记录每次被合并的两个字节片段。内部实现可以使用整数 ID 提高更新效率，但最终接口仍然需要返回 bytes。
+
+训练流程可以概括为：
+
+1. 用 GPT 风格的正则表达式做预分词；
+2. 把每个 pre-token 表示成单字节 token 序列；
+3. 统计所有相邻 pair 的加权频次；
+4. 选择频次最高的 pair，按规定处理并列情况；
+5. 只更新真正受到这次合并影响的 pre-token；
+6. 重复直到词表达到目标大小。
+
+这里最容易低估的是第三到第五步。朴素实现每轮都扫描整个语料，逻辑直观，却会把大量时间花在重复统计没有变化的内容上。
+
+## 预分词：先把边界处理正确
+
+我的预分词函数返回：
+
+```python
+Counter[tuple[bytes, ...]]
+```
+
+例如某个 pre-token 编码后是三个字节，它会成为由三个单字节 `bytes` 组成的 tuple；`Counter` 的值则记录它在语料中出现了多少次。这样既保留 byte-level BPE 的语义，也能把重复 pre-token 压缩成一份状态。
+
+特殊 token 必须是硬边界。普通 BPE 不能跨过 `<|endoftext|>` 合并，也不应该把这个字符串当成普通训练文本。因此流程是：先按所有特殊 token 切分文本，再对普通片段运行正则预分词。
+
+这一阶段我逐渐明确了两层表示：
+
+- 预分词接口使用 `tuple[bytes, ...]`，容易检查是否忠实于 UTF-8 字节；
+- BPE 内部把每个单字节映射成整数 ID，更新 tuple 时更紧凑。
+
+两种表示并不冲突。关键是让模块边界明确，而不是在整个程序里混用 bytes 和 ID。
+
+## 用稳定 word ID 支撑增量更新
+
+为了避免每轮重算所有 pair，我为不同的 pre-token 分配稳定的 `word_id`，并维护下面几组状态：
+
+| 结构 | 含义 |
+| --- | --- |
+| `word_freq[word_id]` | 这个 pre-token 在语料中的出现次数，训练期间不变 |
+| `word_tokens[word_id]` | 这个 pre-token 当前的 token ID 序列 |
+| `pair_counts[pair]` | pair 在整个语料中的加权出现次数 |
+| `pair_to_words[pair]` | 包含这个 pair 的 `word_id` 集合 |
+| `pair_by_counts[count]` | 当前计数等于 `count` 的所有 pair |
+| `heap` | 用负计数实现的最大堆，用来快速找到最高频计数 |
+
+其中 `pair_to_words` 是增量算法的核心。选中一个 pair 后，不必扫描所有 pre-token，只需访问真正包含它的 `word_id`。
+
+每次合并遵守同一个不变量：
+
+1. 从全局统计中减去受影响 word 的旧 pair；
+2. 在这个 word 内做非重叠合并；
+3. 把新 word 的 pair 加回全局统计；
+4. 同步更新反向索引和计数桶。
+
+所有增减都必须乘以 `word_freq[word_id]`。例如某个 pre-token 在语料中出现 100 次，其中一个 pair 在这个 pre-token 内出现两次，那么它对全局计数的贡献是 200，而不是 2。
+
+当多个 pair 频次相同时，还要按两个 token 对应的 bytes 做字典序比较。这里比较的是 token 的实际字节内容，而不是内部整数 ID；ID 只代表创建顺序，不能替代题目规定的 tie-breaking。
+
+## 第一次 profiling：`max` 吞掉了大部分时间
+
+早期实现虽然使用了增量 pair 统计，但每轮仍然通过 `max` 扫描整个 `pair_counts`。一次 `cProfile` 中，总计约 38.2 秒，`max` 和它的比较函数累计占用约 28.9 秒，比较函数被调用接近一亿次。
+
+这说明问题不在 `merge` 函数本身，而在“怎样选出下一个 pair”。于是我加入：
+
+- `pair_by_counts[count]`：把相同计数的 pair 放在同一个集合；
+- 负数最小堆：快速得到当前最大计数；
+- 只在最高计数的集合里做 bytes 字典序比较。
+
+这一步也出现过一个很典型的错误：构造出负计数列表后忘记调用 `heapify`。普通列表的第一个元素不保证是最小值，于是第一次 merge 就选错了。速度测试甚至可能通过，但正确性快照会失败。这个经历提醒我：**性能结构首先仍然是正确性结构，任何优化都要立即回到测试验证。**
+
+## 并行预分词：Map、Reduce 和文件偏移
+
+堆优化后，profiling 显示预分词成为主要开销。由于不同文档之间由特殊 token 隔开，可以在这些边界附近切分文件，让多个进程独立统计。
+
+并行流程本质上是一次 Map–Reduce：
+
+```text
+文件分块 -> 每个 worker 产生局部 Counter -> 主进程合并 Counter
+```
+
+worker 必须定义在模块顶层，因为 macOS 的多进程启动方式需要 pickle 目标函数。任务参数只传路径、起点、终点和特殊 token；每个 worker 自己打开文件。
+
+最容易漏掉的一行是：
+
+```python
+with open(input_path, "rb") as file:
+    file.seek(start)
+    chunk = file.read(end - start)
+```
+
+我最初只写了 `read(end - start)`，忘记 `seek(start)`。结果所有进程都从文件开头读取，只是读取长度不同。小语料因为可能只形成一个分块而碰巧通过，包含大量文档边界的 5MB TinyStories 样本则立刻在特殊 token 测试中失败。
+
+另一个重要区分是：
+
+- `desired_num_chunks` 决定有多少个任务；
+- `num_workers` 决定最多同时运行多少个进程。
+
+16 个分块和 4 个 worker，含义是每个 worker 依次处理多个任务，而不是启动 16 个进程。若只有 2 个分块，即使设置 8 个 worker，也最多只有两个任务能同时运行。
+
+为了保证并行化没有改变答案，我始终比较完整的 Counter：
+
+```python
+assert parallel_counts == serial_counts
+```
+
+只比较 `sum(counts.values())` 不够，因为总数相同并不能证明每种 pre-token 的频次都相同。
+
+## 用中位数选择进程数和分块数
+
+单次计时容易受文件缓存、后台任务和进程启动影响。我使用 `time.perf_counter()`，每种配置运行三次并取中位数。
+
+在包含 1,263,131 个 pre-token 的样本上，固定分块策略后得到：
+
+| workers | 中位数 | 相对单进程加速 |
+| ---: | ---: | ---: |
+| 1 | 1.025 秒 | 1.00× |
+| 2 | 0.828 秒 | 1.24× |
+| 4 | 0.658 秒 | 1.56× |
+| 8 | 0.526 秒 | 1.95× |
+
+固定为 8 个 worker，再比较不少于 worker 数量的分块：
+
+| chunks | 中位数 |
+| ---: | ---: |
+| 8 | 0.4531 秒 |
+| 16 | 0.4566 秒 |
+| 32 | 0.4594 秒 |
+| 64 | 0.4554 秒 |
+
+这四组相差不超过约 1.4%，已经落入正常波动范围。对当前样本来说，达到 8 个分块后性能基本饱和；继续增加任务只会增加调度与序列化开销。最终我保留 16 个分块，并在本机使用 8 个 worker。这个数字是机器和语料相关的实验结果，不应当被当作所有环境的固定答案。
+
+## 真正的大瓶颈：从未清空的零计数集合
+
+并行预分词完成后，我把 `train_bpe` 分成三个阶段计时：
+
+| 阶段 | 优化前时间 | 占比 |
+| --- | ---: | ---: |
+| 预分词 | 1.752 秒 | 18.4% |
+| 构建初始 pair 状态 | 0.045 秒 | 0.5% |
+| merge 循环 | 7.723 秒 | 81.1% |
+
+瓶颈又回到了 merge 循环。我检查计数桶的生命周期后，发现零计数 pair 虽然已从 `pair_counts` 和 `pair_to_words` 删除，却一直留在 `pair_by_counts[0]`：
+
+```python
+for pair in pair_by_counts[0]:
+    pair_counts.pop(pair, None)
+    pair_to_words.pop(pair, None)
+```
+
+这段代码每一轮都会重新扫描此前所有已经失效的 pair。随着 merge 增加，零计数集合越来越大，清理本身反而成为主要工作。
+
+修正方式不是让这个循环更快，而是让旧状态只处理一次：
+
+```python
+zero_pairs = pair_by_counts.pop(0, set())
+
+for pair in zero_pairs:
+    pair_counts.pop(pair, None)
+    pair_to_words.pop(pair, None)
+```
+
+`pop` 在取出集合的同时删除整个零计数 bucket。以后出现新的零计数 pair 时，`defaultdict(set)` 会创建一个新集合，不会再次带回历史垃圾。
+
+这一处修改后的阶段计时是：
+
+| 阶段 | 修改前 | 修改后 |
+| --- | ---: | ---: |
+| 预分词 | 1.752 秒 | 1.769 秒 |
+| 构建初始状态 | 0.045 秒 | 0.057 秒 |
+| merge 循环 | 7.723 秒 | 0.879 秒 |
+| 总时间 | 9.523 秒 | 2.708 秒 |
+
+merge 循环约快了 8.8 倍，总时间约快了 3.5 倍。更重要的是，修改后正确性、特殊 token 和速度测试仍然全部通过。
+
+这也是整个实现过程中最有价值的一课：**性能问题不一定来自复杂算法，有时只是某份已经无效的状态没有离开数据结构。**
+
+## 我使用的测量工具
+
+不同工具回答不同问题。
+
+### `time.perf_counter()`：测一段代码经过了多久
+
+```python
+from time import perf_counter
+
+start = perf_counter()
+vocab, merges = train_bpe(...)
+elapsed = perf_counter() - start
+
+print(f"total train_bpe time = {elapsed:.3f}s")
+```
+
+它适合比较总时间和阶段时间。绝对返回值没有意义，只有结束值减开始值有意义。
+
+### `cProfile`：找到函数级调用热点
+
+`cProfile` 帮我发现早期的 `max` 和比较函数被调用得过于频繁。需要注意，多进程 worker 内部的耗时不会完整显示在主进程 profile 中；它仍然适合分析主进程中的 merge 循环，但并行预分词最好直接测端到端墙钟时间。
+
+### `/usr/bin/time -l`：测墙钟时间和内存
+
+在 macOS 上，我使用：
+
+```bash
+/usr/bin/time -l uv run python experiments/train_bpe_tinystories.py
+```
+
+其中：
+
+- `real` 是实际等待时间；
+- `user` 是所有 CPU 执行用户代码的累计时间，多进程时可以明显大于 `real`；
+- `sys` 是内核态累计时间；
+- `maximum resident set size` 在这里按字节报告，除以 $1024^2$ 得到 MiB。
+
+并行进程下，这个 maximum RSS 数字不应简单理解成所有 worker 同一时刻内存的总和，因此报告结果时也应该保留测量命令和指标名称。
+
+## 这次实现留下的几个方法论
+
+### 1. 先定义不变量，再谈优化
+
+我反复检查的不是“代码看起来是否合理”，而是一些可验证的不变量：特殊 token 不参与普通合并、pair 计数必须乘 word 频率、并列时比较 bytes、串并行 Counter 完全相同、优化前后的 merges 完全相同。
+
+### 2. 每次只改一个主要变量
+
+进程数实验固定分块策略，分块数实验固定 worker 数；阶段计时确认瓶颈后，才修改零计数 bucket。否则看到一个更快的数字，也很难知道究竟是哪项变化起作用。
+
+### 3. 数据结构的生命周期和类型同样重要
+
+选择 `Counter`、反向索引、计数桶和堆只是第一步。还必须持续回答：谁创建它、谁更新它、什么时候删除旧状态、它是否仍然表达当前事实。`pair_by_counts[0]` 的问题正是生命周期错误，而不是容器类型错误。
+
+### 4. 并行化必须同时证明正确性和收益
+
+多个 worker 能更快完成 regex 预分词，但也引入文件偏移、pickle、进程启动、任务数量和汇总内存等新问题。只有同时满足“结果完全相同”和“重复测量确实更快”，并行化才算完成。
+
+## 下一步
+
+`train_bpe` 解决的是“从语料学习词表与 merge 规则”。完整 tokenizer 还需要实现：
+
+- 根据训练得到的 merge rank 编码新文本；
+- 把 token ID 拼回 bytes 并解码；
+- 正确处理允许和禁止的特殊 token；
+- 对大文件提供流式 `encode_iterable`，避免一次读入全部文本。
+
+这次 BPE trainer 的实现让我第一次真正体会到 CS336 所强调的效率视角：算法正确只是起点；测量资源、维护状态不变量，并用实验区分直觉和事实，才是“从头构建”最值得学习的部分。
