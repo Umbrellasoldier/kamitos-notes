@@ -162,6 +162,11 @@ test("CS336 train_bpe 实战保留性能数据、代码与关联阅读", async (
   assert.match(html, /class="katex-display"/);
   assert.match(html, /data-rehype-pretty-code-figure/);
   assert.match(html, /pair_by_counts\.pop/);
+  const visibleText = html.replace(/<[^>]+>/g, "");
+  assert.match(visibleText, /def pretokenize/);
+  assert.match(visibleText, /ProcessPoolExecutor/);
+  assert.match(visibleText, /affected_word_ids/);
+  assert.match(visibleText, /assert parallel_counts == serial_counts/);
   assert.match(html, /145\.602 秒/);
   assert.match(html, /merge 循环约快了 8\.8 倍/);
   assert.match(html, /href="\/posts\/cs336-lecture-01-overview-tokenization"/);

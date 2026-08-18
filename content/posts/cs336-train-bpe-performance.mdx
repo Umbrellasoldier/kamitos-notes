@@ -13,7 +13,7 @@ featured: false
 draft: false
 ---
 
-这篇文章记录我完成 Stanford CS336 Assignment 1 中 `train_bpe` 的过程。它不是一份可以直接提交的完整答案，而是一份实现复盘：我怎样选择数据结构、怎样验证正确性、怎样用 profiling 找到瓶颈，以及为什么一个看起来不起眼的陈旧集合，最后占掉了大部分训练时间。
+这篇文章记录我完成 Stanford CS336 Assignment 1 中 `train_bpe` 的过程。我没有把实现压成一个缺少上下文的大代码块，而是按照数据流拆开关键代码：先看预分词和表示，再看增量索引与 merge 循环，最后进入多进程和 profiling。这样既能看到实际写法，也能解释每个结构为什么存在，以及为什么一个看起来不起眼的陈旧集合，最后占掉了大部分训练时间。
 
 如果想先理解 tokenizer 在语言模型中的位置，可以从本站的 [CS336 第一讲笔记](/posts/cs336-lecture-01-overview-tokenization) 开始；如果想系统复习 UTF-8、BPE 训练与编码，可以继续阅读 [Karpathy Tokenizer 视频笔记](/posts/karpathy-build-gpt-tokenizer)。本文只聚焦一个更工程化的问题：**怎样把 BPE trainer 写对，并让它在完整 TinyStories 语料上跑得足够快。**
 
@@ -79,6 +79,48 @@ Counter[tuple[bytes, ...]]
 
 两种表示并不冲突。关键是让模块边界明确，而不是在整个程序里混用 bytes 和 ID。
 
+### 实际的预分词实现
+
+下面是我实际使用的核心逻辑。特殊 token 会先被 `re.escape`，避免其中的 `|`、`*` 等字符被误当成正则语法；再按长度从长到短排列，防止较短 token 抢先匹配较长 token 的前缀。
+
+```python
+from collections import Counter
+
+import regex as re
+
+
+PAT = (
+    r"'(?:[sdmt]|ll|ve|re)"
+    r"| ?\p{L}+"
+    r"| ?\p{N}+"
+    r"| ?[^\s\p{L}\p{N}]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
+
+def pretokenize(
+    text: str,
+    special_tokens: list[str],
+) -> Counter[tuple[bytes, ...]]:
+    special_pattern = "|".join(
+        re.escape(token)
+        for token in sorted(special_tokens, key=len, reverse=True)
+    )
+    segments = re.split(special_pattern, text) if special_pattern else [text]
+
+    counts: Counter[tuple[bytes, ...]] = Counter()
+    for segment in segments:
+        for match in re.finditer(PAT, segment):
+            encoded = match.group(0).encode("utf-8")
+            byte_atoms = tuple(bytes([byte]) for byte in encoded)
+            counts[byte_atoms] += 1
+
+    return counts
+```
+
+这里不能把整个匹配结果保存成一个 `bytes`，因为 BPE 的初始状态必须仍然是 256 种单字节 token。`tuple(bytes([byte]) for byte in encoded)` 明确表达了这一点。
+
 ## 用稳定 word ID 支撑增量更新
 
 为了避免每轮重算所有 pair，我为不同的 pre-token 分配稳定的 `word_id`，并维护下面几组状态：
@@ -103,6 +145,100 @@ Counter[tuple[bytes, ...]]
 
 所有增减都必须乘以 `word_freq[word_id]`。例如某个 pre-token 在语料中出现 100 次，其中一个 pair 在这个 pre-token 内出现两次，那么它对全局计数的贡献是 200，而不是 2。
 
+### 非重叠 merge
+
+同一个 token 位置不能同时参加两次合并。因此扫描命中 pair 后要前进两格，否则只前进一格：
+
+```python
+def merge(
+    ids: tuple[int, ...],
+    pair: tuple[int, int],
+    new_id: int,
+) -> list[int]:
+    merged: list[int] = []
+    i = 0
+
+    while i < len(ids):
+        if (
+            i + 1 < len(ids)
+            and ids[i] == pair[0]
+            and ids[i + 1] == pair[1]
+        ):
+            merged.append(new_id)
+            i += 2
+        else:
+            merged.append(ids[i])
+            i += 1
+
+    return merged
+```
+
+例如 `[a, a, a]` 合并 `(a, a)` 后应得到 `[aa, a]`，而不是让中间的 `a` 又参与第二次合并。
+
+### 构建初始 pair 统计和反向索引
+
+预分词 Counter 会被转换成稳定的 word ID。下面这段代码同时构造加权计数和 `pair -> word IDs` 的反向索引：
+
+```python
+word_freq: Counter[int] = Counter()
+word_tokens: list[tuple[int, ...]] = []
+
+for word, frequency in pretoken_counts.items():
+    word_id = len(word_tokens)
+    word_freq[word_id] = frequency
+    word_tokens.append(tuple(stoi[byte] for byte in word))
+
+pair_counts: Counter[tuple[int, int]] = Counter()
+pair_to_words: defaultdict[tuple[int, int], set[int]] = defaultdict(set)
+
+for word_id, frequency in word_freq.items():
+    tokens = word_tokens[word_id]
+    for pair in zip(tokens, tokens[1:]):
+        pair_counts[pair] += frequency
+        pair_to_words[pair].add(word_id)
+```
+
+这里的 `pair_to_words` 只保存 `word_id` 一次。pair 在一个 word 内出现几次，由遍历旧序列、逐次增减 `pair_counts` 来表达；word 在语料中重复几次，则由 `word_freq` 表达。
+
+### 只更新受影响的 word
+
+选出本轮 pair 后，先复制反向索引快照，因为循环内部会修改原集合。每个受影响 word 都经历“减去旧贡献、完成合并、加回新贡献”：
+
+```python
+affected_word_ids = pair_to_words[selected_pair].copy()
+
+for word_id in affected_word_ids:
+    frequency = word_freq[word_id]
+    old_word = word_tokens[word_id]
+    new_word = tuple(merge(old_word, selected_pair, new_id))
+
+    for old_pair in zip(old_word, old_word[1:]):
+        old_count = pair_counts[old_pair]
+        pair_by_counts[old_count].discard(old_pair)
+
+        pair_counts[old_pair] -= frequency
+        new_count = pair_counts[old_pair]
+        pair_by_counts[new_count].add(old_pair)
+        heappush(heap, -new_count)
+
+        pair_to_words[old_pair].discard(word_id)
+
+    for new_pair in zip(new_word, new_word[1:]):
+        old_count = pair_counts[new_pair]
+        pair_by_counts[old_count].discard(new_pair)
+
+        pair_counts[new_pair] += frequency
+        new_count = pair_counts[new_pair]
+        pair_by_counts[new_count].add(new_pair)
+        heappush(heap, -new_count)
+
+        pair_to_words[new_pair].add(word_id)
+
+    word_tokens[word_id] = new_word
+```
+
+这段代码看起来比每轮重新 `Counter(zip(...))` 复杂，但它把工作量限制在真正包含 `selected_pair` 的 word 上。几个结构必须一起移动：只改 `pair_counts` 而忘记计数桶或反向索引，下一轮就会读取到互相矛盾的状态。
+
 当多个 pair 频次相同时，还要按两个 token 对应的 bytes 做字典序比较。这里比较的是 token 的实际字节内容，而不是内部整数 ID；ID 只代表创建顺序，不能替代题目规定的 tie-breaking。
 
 ## 第一次 profiling：`max` 吞掉了大部分时间
@@ -114,6 +250,32 @@ Counter[tuple[bytes, ...]]
 - `pair_by_counts[count]`：把相同计数的 pair 放在同一个集合；
 - 负数最小堆：快速得到当前最大计数；
 - 只在最高计数的集合里做 bytes 字典序比较。
+
+对应的初始化和选择代码如下：
+
+```python
+pair_by_counts: defaultdict[int, set[tuple[int, int]]] = defaultdict(set)
+for pair, count in pair_counts.items():
+    pair_by_counts[count].add(pair)
+
+heap = [-count for count in pair_by_counts]
+heapify(heap)
+
+while heap and not pair_by_counts[-heap[0]]:
+    heappop(heap)
+
+if not heap:
+    # 当前语料中已经不存在可继续合并的 pair
+    break
+
+max_count = -heap[0]
+selected_pair = max(
+    pair_by_counts[max_count],
+    key=lambda pair: (vocab[pair[0]], vocab[pair[1]]),
+)
+```
+
+堆里允许存在旧计数，也就是采用 lazy deletion。真正使用堆顶前，先检查对应计数桶是否仍然非空；空桶对应的旧堆项直接弹出。这样不必为了修改某个 pair 的计数，在堆中搜索并删除任意位置的元素。
 
 这一步也出现过一个很典型的错误：构造出负计数列表后忘记调用 `heapify`。普通列表的第一个元素不保证是最小值，于是第一次 merge 就选错了。速度测试甚至可能通过，但正确性快照会失败。这个经历提醒我：**性能结构首先仍然是正确性结构，任何优化都要立即回到测试验证。**
 
@@ -138,6 +300,72 @@ with open(input_path, "rb") as file:
 ```
 
 我最初只写了 `read(end - start)`，忘记 `seek(start)`。结果所有进程都从文件开头读取，只是读取长度不同。小语料因为可能只形成一个分块而碰巧通过，包含大量文档边界的 5MB TinyStories 样本则立刻在特殊 token 测试中失败。
+
+完整的 worker 很短：
+
+```python
+def _pretokenize_chunk(
+    input_path: str,
+    start: int,
+    end: int,
+    special_tokens: list[str],
+) -> Counter[tuple[bytes, ...]]:
+    with open(input_path, "rb") as file:
+        file.seek(start)
+        chunk = file.read(end - start)
+
+    text = chunk.decode("utf-8", errors="ignore")
+    return pretokenize(text, special_tokens)
+```
+
+主进程负责构造任务、选择串行或并行路径，并把每个局部 Counter 合并到总 Counter：
+
+```python
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+
+def pretokenize_file(
+    input_path: str,
+    special_tokens: list[str],
+    desired_num_chunks: int,
+    num_workers: int = 4,
+) -> Counter[tuple[bytes, ...]]:
+    total_counts: Counter[tuple[bytes, ...]] = Counter()
+
+    with open(input_path, "rb") as file:
+        if special_tokens:
+            boundary_token = special_tokens[0].encode("utf-8")
+            boundaries = find_chunk_boundaries(
+                file,
+                desired_num_chunks,
+                boundary_token,
+            )
+        else:
+            file.seek(0, os.SEEK_END)
+            boundaries = [0, file.tell()]
+
+    tasks = [
+        (input_path, start, end, special_tokens)
+        for start, end in zip(boundaries, boundaries[1:])
+    ]
+
+    if num_workers == 1 or len(tasks) == 1:
+        for task in tasks:
+            total_counts.update(_pretokenize_chunk(*task))
+        return total_counts
+
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [
+            executor.submit(_pretokenize_chunk, *task)
+            for task in tasks
+        ]
+        for future in as_completed(futures):
+            total_counts.update(future.result())
+
+    return total_counts
+```
+
+文件边界由课程提供的 `find_chunk_boundaries` 思路确定：先按字节位置估计均匀分块，再向后寻找特殊 token，把边界移动到文档间隙。这样每个 chunk 都能独立预分词，不会把一个普通 pre-token 从中间切开。
 
 另一个重要区分是：
 
@@ -240,6 +468,53 @@ print(f"total train_bpe time = {elapsed:.3f}s")
 ```
 
 它适合比较总时间和阶段时间。绝对返回值没有意义，只有结束值减开始值有意义。
+
+我实际使用的 worker benchmark 会同时检查答案是否一致，并为每种配置取三次运行的中位数：
+
+```python
+from pathlib import Path
+from statistics import median
+from time import perf_counter
+
+from cs336_basics.bpe import pretokenize_file
+
+
+def measure(input_path: Path, num_workers: int):
+    times: list[float] = []
+    last_counts = None
+
+    for _ in range(3):
+        start = perf_counter()
+        counts = pretokenize_file(
+            input_path,
+            special_tokens=["<|endoftext|>"],
+            desired_num_chunks=8,
+            num_workers=num_workers,
+        )
+        elapsed = perf_counter() - start
+
+        print(
+            f"workers={num_workers}, "
+            f"time={elapsed:.3f}s, "
+            f"pretokens={sum(counts.values())}"
+        )
+        times.append(elapsed)
+        last_counts = counts
+
+    print(f"median={median(times):.3f}s, all={times}")
+    return last_counts
+
+
+if __name__ == "__main__":
+    input_path = Path("tests/fixtures/tinystories_sample_5M.txt")
+    serial_counts = measure(input_path, num_workers=1)
+
+    for num_workers in [2, 4, 8]:
+        parallel_counts = measure(input_path, num_workers)
+        assert parallel_counts == serial_counts
+```
+
+`if __name__ == "__main__"` 在 macOS 上尤其重要。spawn 模式会在子进程中重新导入主模块；如果创建进程池的代码位于模块顶层，就可能递归启动新进程。
 
 ### `cProfile`：找到函数级调用热点
 
