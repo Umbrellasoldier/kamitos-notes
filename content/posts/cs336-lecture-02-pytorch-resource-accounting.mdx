@@ -1,0 +1,904 @@
+---
+title: "CS336 第二讲笔记：PyTorch、显存与计算资源核算"
+description: "从张量、精度与 einops 出发，推导训练显存、FLOPs、MFU、算术强度和 Roofline，并理解梯度累积与激活检查点如何用计算换显存。"
+publishedAt: "2026-08-20"
+category: "技术"
+tags:
+  - "CS336"
+  - "PyTorch"
+  - "大语言模型"
+  - "性能优化"
+  - "深度学习"
+featured: false
+draft: false
+---
+
+这篇笔记对应 Stanford CS336 2026 年春季课程第二讲 **PyTorch（einops）与资源核算**。第一讲解释了课程全景和 BPE；第二讲开始建立一套贯穿后续训练、系统和缩放实验的共同语言：一个张量占多少显存，一次运算需要多少 FLOPs，为什么 GPU 明明很快，程序却仍可能在等待数据。
+
+本文主要依据 [Bilibili 第二讲中文视频](https://www.bilibili.com/video/BV11LEA6eEuj/?p=2)、[官方可执行讲义](https://cs336.stanford.edu/lectures/?trace=lecture_02)和当前版本的 [`lecture_02.py`](https://github.com/stanford-cs336/lectures/blob/main/lecture_02.py)整理。视频页面没有提供无需登录即可读取的完整字幕，因此我没有把它当作逐字稿；公式、代码和数值以官方讲义及课程仓库为准，再按“概念—推导—代码—工程含义”的顺序重组。
+
+如果还没看第一讲，可以先读[《CS336 第一讲笔记：从课程全景到 BPE 分词》](/posts/cs336-lecture-01-overview-tokenization)。
+
+## 一页总结
+
+这一讲最值得带走的不是某个 PyTorch API，而是下面这套资源核算框架：
+
+1. **张量不只有数值，还有形状、精度、设备和梯度状态。** 它们共同决定运算是否合法、数据放在哪里，以及需要多少内存。
+2. **显存先按字节算。** 一个张量的理论大小就是元素个数乘以每个元素的字节数；训练还要计入参数、梯度、优化器状态和激活。
+3. **FLOPs 是工作量，FLOP/s 是速度。** 矩阵乘法 $[B,D]@[D,K]$ 约需要 $2BDK$ FLOPs。
+4. **快不快不能只看 FLOPs。** 算术强度低时，算子受显存带宽限制；算术强度高时，才可能靠近芯片的计算峰值。
+5. **反向传播通常比前向更贵。** 线性层的一次前向矩阵乘法，反向要再做两次同量级矩阵乘法，因此常见训练估算是 $C\approx6ND$。
+6. **批量大小和模型大小不是一回事。** 梯度累积减小单步激活峰值；激活检查点则舍弃部分中间结果，在反向时重新计算。二者都在用时间换显存。
+
+可以把整讲压缩成一句话：
+
+> 写出张量形状，数清字节和 FLOPs，再判断瓶颈在计算、带宽还是容量；不要只凭“模型很大”或“GPU 很快”猜测性能。
+
+## 先做两道餐巾纸计算
+
+课程一开始没有立刻讲 PyTorch，而是先问两个看似粗糙、实际非常重要的问题。它们叫 **back-of-the-envelope calculation**：不用追求个位数精度，而是先判断一个方案在数量级上是否可行。
+
+### 训练 70B 模型大约要多久
+
+假设训练一个 $70\text{B}$ 参数的稠密模型，共看 $15\text{T}$ 个 token。训练计算量常用下面的经验式估算：
+
+$$
+C \approx 6ND,
+$$
+
+其中：
+
+- $N=70\times10^9$ 是参数量；
+- $D=15\times10^{12}$ 是训练 token 数；
+- 系数 6 近似覆盖每个参数、每个 token 的前向与反向计算。
+
+代入得到：
+
+$$
+C\approx 6\times70\times10^9\times15\times10^{12}
+=6.3\times10^{24}\ \text{FLOPs}.
+$$
+
+接着假设使用 1024 张 H100。课程把每张卡的稠密 BF16 峰值按约 $989.5\text{ TFLOP/s}$ 计算，并假设实际只能达到峰值的一半，也就是模型 FLOPs 利用率 $mathrm{MFU}=0.5$：
+
+$$
+\text{每天有效计算量}
+=1024\times989.5\times10^{12}\times0.5\times86400
+\approx4.38\times10^{22}\ \text{FLOPs/day}.
+$$
+
+于是训练时间约为：
+
+$$
+\frac{6.3\times10^{24}}{4.38\times10^{22}}
+\approx143.9\ \text{天}.
+$$
+
+也就是大约 **144 天**。这个结果不是项目报价：真实训练还会受注意力长度、网络通信、数据加载、故障恢复、检查点和空闲时间影响。它的价值在于，十几秒的估算就能告诉我们：这是一个以“数月”和“大规模集群”为单位的工程，而不是几天能完成的单机实验。
+
+### 8 张 80 GB H100 最多能装多大的模型
+
+再考虑 8 张 80 GB H100，总显存名义上是 640 GB。用 AdamW 训练、并假设以下状态：
+
+| 状态 | 每个参数的字节数 | 说明 |
+| --- | ---: | --- |
+| 参数 | 2 B | BF16 |
+| 梯度 | 2 B | BF16 |
+| 一阶矩 | 4 B | FP32 |
+| 二阶矩 | 4 B | FP32 |
+| 合计 | 12 B | 尚未计算激活和临时缓冲区 |
+
+只按这 12 B 计算，参数量上限是：
+
+$$
+N_{\max}\approx\frac{640\times10^9}{12}
+\approx53.3\times10^9.
+$$
+
+答案约为 **53.3B 参数**，但这只是一个非常宽松的理论上界。它忽略了激活、CUDA 上下文、通信缓冲区、内存碎片和框架开销，所以真正能训练的模型一定更小。它仍然提供了一个立即可用的判断：如果仅模型状态已经超过总显存，后面必须考虑分片、卸载或降低精度，而不是继续微调 batch size。
+
+## 张量：先把四个属性说清楚
+
+PyTorch 中最核心的数据结构是张量。可以把一个张量理解为“多维数组 + 计算元信息”。看到任何张量时，至少要问四件事：
+
+| 属性 | 典型值 | 它决定什么 |
+| --- | --- | --- |
+| `shape` | `[batch, seq, heads, head_dim]` | 轴的含义、运算能否对齐、元素总数 |
+| `dtype` | `float32`、`bfloat16` | 精度、数值范围、每个元素占多少字节 |
+| `device` | `cpu`、`cuda:0` | 数据实际存放和计算发生的位置 |
+| `requires_grad` | `True` / `False` | autograd 是否记录运算并计算梯度 |
+
+例如一个 Transformer 注意力张量常写成：
+
+```python
+import torch
+
+x = torch.randn(
+    8, 2048, 32, 128,
+    dtype=torch.bfloat16,
+    device="cuda",
+    requires_grad=True,
+)
+
+print(x.shape)          # torch.Size([8, 2048, 32, 128])
+print(x.numel())        # 元素总数
+print(x.element_size()) # 每个元素的字节数
+```
+
+这里的秩（rank）是 4，维度语义依次是 batch、序列长度、注意力头数、每头维度。只说“这是一个四维张量”还不够；如果不知道每个轴代表什么，后面的转置、归约和矩阵乘法很容易在形状正确时做出语义错误的计算。
+
+### 张量如何占用内存
+
+理论存储量的公式非常简单：
+
+$$
+\text{bytes}(x)=\operatorname{numel}(x)\times\operatorname{element\_size}(x).
+$$
+
+对应代码：
+
+```python
+def tensor_bytes(x: torch.Tensor) -> int:
+    return x.numel() * x.element_size()
+
+def to_mib(num_bytes: int) -> float:
+    return num_bytes / 1024**2
+```
+
+以 GPT-3 规模的一块前馈层权重为例，隐藏维度 $D=12288$，扩展后的中间维度为 $4D$。权重矩阵形状是 $(4D,D)$。用 FP32 存储时：
+
+$$
+4D^2\times4\text{ B}
+=4\times12288^2\times4\text{ B}
+=2304\text{ MiB}
+=2.25\text{ GiB}.
+$$
+
+只是一块矩阵就超过 2 GiB。这正是为什么不能凭参数“看上去不多”估计显存，而要把形状乘开。
+
+> `numel × element_size` 给出张量数据的理论字节数，不等于进程最终看到的显存增量。分配器缓存、对齐、工作区、计算图和内存碎片都会带来额外开销。
+
+## 数值格式：范围、精度与显存的三角权衡
+
+浮点数通常由符号位、指数位和尾数组成。指数位主要决定可表示的数量级范围，尾数位主要决定相邻数之间的精细程度。
+
+![FP32 的符号位、指数位与尾数位布局](/posts/cs336-lecture-02-pytorch-resource-accounting/fp32.png)
+
+*FP32 使用 1 位符号、8 位指数和 23 位显式尾数。图源：[Stanford CS336 课程仓库](https://github.com/stanford-cs336/lectures/tree/main/images)。*
+
+![FP16 的符号位、指数位与尾数位布局](/posts/cs336-lecture-02-pytorch-resource-accounting/fp16.png)
+
+*FP16 将更多位留给尾数，但指数只有 5 位，范围明显变窄。*
+
+![BF16 的符号位、指数位与尾数位布局](/posts/cs336-lecture-02-pytorch-resource-accounting/bf16.png)
+
+*BF16 保留与 FP32 相同的 8 位指数，以较低精度换取相近的动态范围。*
+
+常见格式可以这样比较：
+
+| 格式 | 总位数 | 指数位 | 显式尾数位 | 每元素 | 直观特点 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| FP32 | 32 | 8 | 23 | 4 B | 范围和精度都较好，内存与吞吐成本更高 |
+| FP16 | 16 | 5 | 10 | 2 B | 精度优于 BF16，但动态范围较小，容易溢出或下溢 |
+| BF16 | 16 | 8 | 7 | 2 B | 范围接近 FP32，精度较低，训练中更稳健 |
+| FP8 E4M3 | 8 | 4 | 3 | 1 B | 更多精度，范围较小，常用于前向或激活等场景 |
+| FP8 E5M2 | 8 | 5 | 2 | 1 B | 更多范围，精度更低，适合范围更大的量 |
+
+一个小例子能说明 FP16 和 BF16 的关键差异：
+
+```python
+value = torch.tensor([1e-8], dtype=torch.float32)
+
+print(value.to(torch.float16))   # 可能变成 0
+print(value.to(torch.bfloat16))  # 仍能表示这个数量级
+```
+
+这不是说 BF16 在所有意义上都比 FP16 准确。BF16 的尾数更短，所以在同一数量级附近能区分的数更少；它的优势是保住了 FP32 的指数范围，更不容易把大梯度变成无穷或把小梯度直接压成零。
+
+### 为什么训练常用混合精度
+
+训练并不要求所有数据使用相同精度。一个常见策略是：
+
+- 参数、激活和许多矩阵乘法使用 BF16，以减少显存并利用更高吞吐；
+- 优化器的累计状态保留 FP32，以避免许多微小更新在低精度中丢失；
+- 某些归约或对数等数值敏感操作由框架选择更安全的精度。
+
+PyTorch 的自动混合精度会在适合的算子上选择低精度：
+
+```python
+model = model.to("cuda")
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+for inputs, targets in loader:
+    inputs = inputs.to("cuda")
+    targets = targets.to("cuda")
+
+    optimizer.zero_grad(set_to_none=True)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        logits = model(inputs)
+        loss = loss_fn(logits, targets)
+
+    loss.backward()
+    optimizer.step()
+```
+
+BF16 通常不需要 FP16 训练中常见的 loss scaling，但具体硬件和算子仍需实测。更低精度的 FP8、NVFP4 还会依赖缩放因子，把一组数的动态范围映射到更短的数据格式。它们的收益不只是“文件减半”，而是减少内存流量并使用对应的低精度计算单元；代价则是量化、缩放和数值误差管理更复杂。
+
+## CPU 与 GPU：移动数据也是工作
+
+PyTorch 默认在 CPU 上创建张量。GPU 只能直接计算位于对应 GPU 内存中的数据，因此 `.to("cuda")` 并不是改变一个标签，而是实际的数据传输：
+
+```python
+x_cpu = torch.randn(1024, 1024)
+x_gpu = x_cpu.to("cuda")
+
+# 更直接：一开始就在目标设备创建
+y_gpu = torch.randn(1024, 1024, device="cuda")
+```
+
+![CPU 主存与 GPU 显存之间需要传输数据](/posts/cs336-lecture-02-pytorch-resource-accounting/cpu-gpu.png)
+
+*CPU 和 GPU 拥有各自的内存空间，跨设备传输经常比一次小运算更贵。图源：[Stanford CS336 课程仓库](https://github.com/stanford-cs336/lectures/tree/main/images)。*
+
+由此得到三条实用原则：
+
+1. 不要在训练循环里反复把同一小张量在 CPU 和 GPU 之间来回移动；
+2. 创建临时张量时指定与输入相同的 `device` 和 `dtype`；
+3. 计时 GPU 运算前后要正确同步，否则只测到了异步任务的提交时间。
+
+```python
+import time
+
+torch.cuda.synchronize()
+start = time.perf_counter()
+
+result = x_gpu @ y_gpu
+
+torch.cuda.synchronize()
+elapsed = time.perf_counter() - start
+```
+
+在正式性能分析中，应该先预热并多次重复，优先使用 `torch.utils.benchmark` 或 profiler；这段代码只说明同步的必要性。
+
+## 用 einops 让张量运算说人话
+
+深度学习代码最常见的错误之一是轴位置弄错。`transpose(1, 2)` 很短，但读者必须回头查第 1、2 轴是什么。einops 的思路是用名字描述维度，让代码接近公式。
+
+这一讲主要使用三个接口：
+
+- `einsum`：按命名维度做乘法和求和；
+- `reduce`：沿指定维度求和、平均、最大值等；
+- `rearrange`：转置、合并或拆分维度。
+
+### einsum：没有出现在输出里的轴会被求和
+
+设输入 $x$ 的形状为 `[batch, sequence, hidden]`，权重 $w$ 的形状为 `[hidden, output]`：
+
+```python
+from einops import einsum
+
+y = einsum(
+    x,
+    w,
+    "batch sequence hidden, hidden output -> batch sequence output",
+)
+```
+
+`hidden` 同时出现在两个输入中，却没有出现在输出中，所以它被相乘后求和。这就是线性层：
+
+$$
+y_{bso}=\sum_h x_{bsh}w_{ho}.
+$$
+
+批量点积则可以写成：
+
+```python
+scores = einsum(
+    q,
+    k,
+    "... sequence hidden, ... key hidden -> ... sequence key",
+)
+```
+
+`...` 代表任意数量的前导维度，例如 batch 和 heads。这样同一表达式可以自然处理三维或四维输入。
+
+### reduce：明确说出哪些轴会消失
+
+```python
+from einops import reduce
+
+# 对序列维取平均，输出 [batch, hidden]
+pooled = reduce(x, "batch sequence hidden -> batch hidden", "mean")
+
+# 对 batch 和序列维求和，输出 [hidden]
+totals = reduce(x, "batch sequence hidden -> hidden", "sum")
+```
+
+reduce 和 einsum 的共同优点是：输出形状可以从字符串直接读出来。
+
+### rearrange：拆头与合头
+
+多头注意力常需要把总隐藏维拆成 `heads × head_dim`，计算后再合回去：
+
+```python
+from einops import rearrange
+
+# [B, S, H*D] -> [B, H, S, D]
+q = rearrange(
+    q,
+    "batch sequence (heads head_dim) -> batch heads sequence head_dim",
+    heads=num_heads,
+)
+
+# [B, H, S, D] -> [B, S, H*D]
+q = rearrange(
+    q,
+    "batch heads sequence head_dim -> batch sequence (heads head_dim)",
+)
+```
+
+括号表示维度的合并或拆分。与手写 `view + transpose + contiguous` 相比，这种写法把意图写进了代码，但仍要保证元素总数匹配，并理解结果是否连续存储。
+
+## FLOPs：先分清工作量和速度
+
+两个缩写很容易混淆：
+
+- **FLOPs** 中的复数 `s` 表示浮点运算次数，是总工作量；
+- **FLOP/s** 表示每秒能完成多少浮点运算，是吞吐速度。
+
+如果一个任务需要 $10^{15}$ FLOPs，机器持续达到 $10^{12}$ FLOP/s，理想时间就是 1000 秒。现实中还要考虑内存、调度和通信，所以实际只会更慢。
+
+### 为什么矩阵乘法是 2BDK
+
+令：
+
+$$
+X\in\mathbb{R}^{B\times D},\qquad
+W\in\mathbb{R}^{D\times K},\qquad
+Y=XW\in\mathbb{R}^{B\times K}.
+$$
+
+$Y$ 有 $BK$ 个输出。每个输出是长度为 $D$ 的点积，包含约 $D$ 次乘法和 $D$ 次加法。如果把一次乘法和一次加法分别算作一个 FLOP：
+
+$$
+\mathrm{FLOPs}(XW)\approx BK\times2D=2BDK.
+$$
+
+严格来说长度为 $D$ 的点积只有 $D-1$ 次加法，但在大矩阵估算中用 $2D$ 更清晰，误差也可以忽略。
+
+### MFU：模型真正用了多少峰值算力
+
+模型 FLOPs 利用率定义为：
+
+$$
+\mathrm{MFU}
+=\frac{\text{模型实际完成的 FLOP/s}}
+{\text{硬件承诺的峰值 FLOP/s}}.
+$$
+
+例如，一步理论需要 $2\times10^{14}$ FLOPs，耗时 0.4 秒，则实际吞吐为 $5\times10^{14}$ FLOP/s。如果硬件对应精度的峰值是 $10^{15}$ FLOP/s，MFU 就是 50%。
+
+```python
+actual_flops_per_second = flops_per_step / seconds_per_step
+mfu = actual_flops_per_second / promised_flops_per_second
+```
+
+MFU 不是“GPU 使用率”面板上的百分比。后者可能只说明某段时间有内核在运行；MFU 要用模型理论 FLOPs、实测步时和正确的硬件峰值共同计算。课程把 50% 左右视为不错的量级，但这不是所有模型、精度和集群都必须达到的统一及格线。
+
+## 算术强度与 Roofline：GPU 为什么会等内存
+
+GPU 可以极快地做乘加，但数据必须先从高带宽显存（HBM）送到计算单元。计算单元与内存之间的通道有限，因此一个算子可能不是“算不动”，而是“数据来不及送到”。
+
+![内存与计算单元之间的有限带宽](/posts/cs336-lecture-02-pytorch-resource-accounting/compute-memory.png)
+
+*很多性能问题本质上是数据搬运问题。图源：[Stanford CS336 课程仓库](https://github.com/stanford-cs336/lectures/tree/main/images)。*
+
+算术强度（arithmetic intensity）定义为：
+
+$$
+I=\frac{\text{执行的 FLOPs}}{\text{从主存读取并写回的字节数}}
+\quad(\text{FLOPs/byte}).
+$$
+
+它回答的是：每搬运 1 字节数据，能做多少计算。硬件本身也有一个临界值，常叫 machine balance：
+
+$$
+I_{\text{machine}}
+=\frac{\text{峰值计算吞吐（FLOP/s）}}
+{\text{内存带宽（byte/s）}}.
+$$
+
+按讲义对 H100 的假设，稠密 BF16 峰值约为 $989.5\text{ TFLOP/s}$，HBM 带宽约为 $3.35\text{ TB/s}$：
+
+$$
+I_{\text{machine}}\approx
+\frac{989.5\times10^{12}}{3.35\times10^{12}}
+\approx295.37\ \text{FLOPs/byte}.
+$$
+
+于是有一个非常实用的判断：
+
+- $I<I_{\text{machine}}$：内存带宽先到极限，算子倾向于 **memory-bound**；
+- $I>I_{\text{machine}}$：计算单元先到极限，算子倾向于 **compute-bound**。
+
+Roofline 模型把这个关系写成：
+
+$$
+\text{可达到的吞吐}
+\leq\min\left(
+\text{峰值 FLOP/s},
+\text{带宽}\times I
+\right).
+$$
+
+如果除以峰值吞吐，理想上限形式的 MFU 是：
+
+$$
+\mathrm{MFU}_{\text{roofline}}
+\leq\min\left(1,\frac{I}{I_{\text{machine}}}\right).
+$$
+
+课程用近似数字比较了几类运算：
+
+| 运算 | 近似算术强度 | 在 295.37 FLOPs/B 临界值下 | 直觉 |
+| --- | ---: | --- | --- |
+| ReLU | 0.25 | memory-bound | 每个元素只做一次简单运算，却要读写数据 |
+| GELU | 5.0 | memory-bound | 计算多一些，仍远低于机器临界值 |
+| 向量点积 | 约 0.5 | memory-bound | 读两个向量，复用很少 |
+| 矩阵—向量乘 | 约 1.0 | memory-bound | 权重通常只为一个向量使用一次 |
+| $1024^3$ 矩阵乘 | 约 341.17 | compute-bound | 数据块能被大量复用 |
+
+### 为什么大矩阵乘法算术强度高
+
+对于方阵 $N\times N$ 的矩阵乘法：
+
+- 计算量约为 $2N^3$ FLOPs；
+- 理想情况下读取两个输入、写一个输出，约移动 $3N^2$ 个元素。
+
+如果每个元素是 $s$ 字节：
+
+$$
+I\approx\frac{2N^3}{3N^2s}=\frac{2N}{3s}.
+$$
+
+算术强度会随 $N$ 线性增长。原因不是矩阵乘法“天生高级”，而是同一块数据可以参与很多次乘加；良好的 tiling 会让数据留在更快的片上存储中反复使用。
+
+### 训练和推理为什么可能有不同瓶颈
+
+训练时 batch 和序列通常较大，线性层更接近大矩阵乘法，容易进入 compute-bound 区域。自回归推理一次只生成一个 token、batch 又很小时，很多线性层更像矩阵—向量乘：每步都要读取大量权重，却只服务少量 token，因此常常受内存带宽限制。
+
+这解释了一个看似反直觉的现象：低精度不仅可以使用更快的矩阵乘单元，还能减少权重和激活的传输字节数；在 memory-bound 推理中，后者可能更加重要。
+
+Roofline 是上界模型，而不是精准计时器。内核启动、并行度、缓存未命中、形状不友好、通信和框架开销都会让真实吞吐低于这条“屋顶线”。想继续深入，可以阅读官方讲义推荐的 [JAX Scaling Book：Roofline](https://jax-ml.github.io/scaling-book/roofline/)。
+
+## Autograd：梯度是怎样沿计算图返回的
+
+PyTorch autograd 会在前向运算时记录计算关系，在调用 `.backward()` 后按链式法则反向计算梯度。
+
+考虑一个最小线性回归例子：
+
+```python
+x = torch.tensor([1.0, 2.0, 3.0])
+w = torch.tensor([1.0, 1.0, 1.0], requires_grad=True)
+target = torch.tensor(5.0)
+
+prediction = x @ w                 # 6
+loss = 0.5 * (prediction - target) ** 2  # 0.5
+loss.backward()
+
+print(w.grad)  # tensor([1., 2., 3.])
+```
+
+推导也很直接：
+
+$$
+\hat y=x^\top w,\qquad
+L=\frac12(\hat y-y)^2.
+$$
+
+因此：
+
+$$
+\frac{\partial L}{\partial w}
+=(\hat y-y)x.
+$$
+
+这里 $\hat y-y=1$，所以梯度就是 $[1,2,3]$。`requires_grad=True` 告诉 PyTorch 需要为 `w` 追踪梯度，反向完成后结果累积在 `w.grad` 中。
+
+“累积”很关键：PyTorch 默认不会在每次 `.backward()` 前自动清空已有梯度。这既使梯度累积成为可能，也意味着普通训练循环必须主动调用 `optimizer.zero_grad()`。
+
+## 为什么反向约是前向的两倍
+
+考虑线性层：
+
+$$
+H_2=H_1W_2,
+$$
+
+其中 $H_1\in\mathbb{R}^{B\times D}$，$W_2\in\mathbb{R}^{D\times D}$。前向需要一次矩阵乘法：
+
+$$
+\mathrm{FLOPs}_{\text{forward}}\approx2BD^2.
+$$
+
+反向传播拿到上游梯度 $G_2=\partial L/\partial H_2$ 后，要同时求：
+
+$$
+\frac{\partial L}{\partial H_1}=G_2W_2^\top,
+\qquad
+\frac{\partial L}{\partial W_2}=H_1^\top G_2.
+$$
+
+这又是两次相同量级的矩阵乘法，所以：
+
+$$
+\mathrm{FLOPs}_{\text{backward}}\approx4BD^2,
+$$
+
+前向加反向约为 $6BD^2$。推广到由大矩阵乘法主导的网络，就得到开头的经验公式：
+
+$$
+C_{\text{train}}\approx6ND,
+$$
+
+这里 $N$ 是参数量，$D$ 是训练数据点或 token 数。这个估算对 MLP 和上下文不太长的稠密 Transformer 很有用，但它不是物理定律：长上下文注意力会加入随序列长度平方增长的计算，embedding、归一化、激活函数、MoE 路由和通信也没有被完整计入。
+
+## 用 nn.Module 组织一个深层网络
+
+PyTorch 的 `nn.Module` 不只是方便调用。它会注册参数和子模块，使 `.parameters()`、设备迁移、状态保存及训练/评估模式能够递归工作。
+
+```python
+import math
+from torch import nn
+
+class Block(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        weight = torch.randn(dim, dim) / math.sqrt(dim)
+        self.weight = nn.Parameter(weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.relu(x @ self.weight)
+
+
+class DeepNetwork(nn.Module):
+    def __init__(self, dim: int, num_layers: int):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [Block(dim) for _ in range(num_layers)]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x)
+        return x
+```
+
+![多层网络中前向依次生成激活、反向依次传播梯度](/posts/cs336-lecture-02-pytorch-resource-accounting/deep-network.png)
+
+*深层网络不仅要保存参数，还可能为了反向传播保留每层激活。图源：[Stanford CS336 课程仓库](https://github.com/stanford-cs336/lectures/tree/main/images)。*
+
+这段代码里有两个容易忽视的点：
+
+- 普通 `list` 不会自动注册其中的子模块；需要使用 `nn.ModuleList`；
+- 普通张量不会自动成为可训练参数；需要使用 `nn.Parameter`，或由 `nn.Linear` 等模块创建。
+
+若忽略偏置，每层参数量为 $D^2$，$L$ 层约有 $LD^2$ 个参数。初始化除以 $\sqrt D$ 是为了让每个输出维度累加 $D$ 项后，方差仍保持在合理量级；更完整的初始化策略会随激活函数和网络结构调整。
+
+## 优化器：更新公式背后还有状态显存
+
+最简单的随机梯度下降只保存参数和梯度：
+
+$$
+\theta_{t+1}=\theta_t-\eta g_t.
+$$
+
+现代优化器会保存历史统计量：
+
+- Momentum 保存梯度的指数移动平均；
+- AdaGrad 累积平方梯度，为不同参数自适应缩放学习率；
+- RMSProp 用平方梯度的移动平均，避免 AdaGrad 分母只增不减；
+- Adam 同时维护一阶矩和二阶矩。
+
+课程用一个极简 AdaGrad 展示如何写自定义优化器：
+
+```python
+class AdaGrad(torch.optim.Optimizer):
+    def __init__(self, params, lr=1e-2, eps=1e-10):
+        super().__init__(params, {"lr": lr, "eps": eps})
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            lr = group["lr"]
+            eps = group["eps"]
+
+            for parameter in group["params"]:
+                if parameter.grad is None:
+                    continue
+
+                state = self.state[parameter]
+                if "sum_sq" not in state:
+                    state["sum_sq"] = torch.zeros_like(
+                        parameter,
+                        dtype=torch.float32,
+                    )
+
+                grad = parameter.grad.float()
+                state["sum_sq"].addcmul_(grad, grad)
+                denominator = state["sum_sq"].sqrt().add_(eps)
+                parameter.add_((grad / denominator).to(parameter.dtype), alpha=-lr)
+```
+
+核心更新是：
+
+$$
+G_t=G_{t-1}+g_t^2,
+\qquad
+\theta_t=\theta_{t-1}-\eta\frac{g_t}{\sqrt{G_t}+\epsilon}.
+$$
+
+从资源角度看，算法多保存一份统计量，就多一份与参数同形状的长期状态。假设参数和梯度为 BF16、状态为 FP32：
+
+| 组成 | AdaGrad | Adam |
+| --- | ---: | ---: |
+| 参数 | 2 B/param | 2 B/param |
+| 梯度 | 2 B/param | 2 B/param |
+| 优化器状态 | 4 B/param | 8 B/param |
+| 小计 | 8 B/param | 12 B/param |
+
+表中仍没有激活、临时缓冲区或某些实现保存的 FP32 主参数副本。优化器不只是收敛行为的选择，也是显存架构的选择。
+
+## 一次标准训练迭代发生了什么
+
+一个最小训练循环包含五步：取数据、前向、计算损失、反向、更新并清空梯度。
+
+```python
+model.train()
+
+for inputs, targets in loader:
+    inputs = inputs.to(device)
+    targets = targets.to(device)
+
+    optimizer.zero_grad(set_to_none=True)
+
+    predictions = model(inputs)
+    loss = loss_fn(predictions, targets)
+    loss.backward()
+
+    optimizer.step()
+```
+
+`zero_grad(set_to_none=True)` 让梯度变成 `None`，通常比逐元素写零省一次内存操作；下一次反向会直接创建梯度。需要手动读取或修改梯度的代码要意识到 `None` 与全零张量并不完全等价。
+
+训练时的峰值显存通常包括：
+
+$$
+M_{\text{peak}}
+\approx M_{\text{parameters}}
++M_{\text{gradients}}
++M_{\text{optimizer}}
++M_{\text{activations}}
++M_{\text{temporary}}.
+$$
+
+前三项主要随参数量增长；激活主要随 batch、序列长度、隐藏维和层数增长。判断 OOM 时，先弄清增长的是哪一项，才能选择正确工具。
+
+## 梯度累积：把一个大 batch 分几次前向
+
+如果整个 batch 的激活放不进显存，可以把有效 batch 切成多个 microbatch。每个 microbatch 都做前向和反向，但中途不清空梯度，也不更新参数；所有 microbatch 处理完后只执行一次 `step()`。
+
+```python
+accumulation_steps = 4
+optimizer.zero_grad(set_to_none=True)
+
+for step, (inputs, targets) in enumerate(loader, start=1):
+    inputs = inputs.to(device)
+    targets = targets.to(device)
+
+    predictions = model(inputs)
+    loss = loss_fn(predictions, targets)
+
+    # loss_fn 默认对 microbatch 求 mean；除以累积次数，
+    # 才与一个完整大 batch 的 mean 梯度一致。
+    (loss / accumulation_steps).backward()
+
+    if step % accumulation_steps == 0:
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+```
+
+若每个 microbatch 大小相同，且 loss 使用 `mean` reduction，上面的除法会让最终梯度等于完整 batch 的平均梯度。如果 microbatch 大小不一致，应按样本或 token 数加权，而不是机械除以固定次数。
+
+它降低的是**单次前向需要保存的激活峰值**，并不会减少参数、梯度或优化器状态，也不会让总计算量凭空消失。由于内核启动更多、每个矩阵可能更小，吞吐甚至可能下降。
+
+有效 batch size 可以写成：
+
+$$
+B_{\text{effective}}
+=B_{\text{micro}}
+\times N_{\text{accumulation}}
+\times N_{\text{data-parallel}}.
+$$
+
+实际代码还要处理最后不足一个累积周期的 batch，或设置 `drop_last=True`；分布式训练中也常在非更新步暂停梯度同步。
+
+## 激活检查点：反向时把前向再算一遍
+
+反向传播需要前向产生的中间激活。普通实现会保存每层需要的激活，内存随层数 $L$ 近似线性增长。激活检查点（activation checkpointing，也叫 rematerialization）只保存少量边界，反向走到某一段时重新执行那段前向。
+
+PyTorch 的基本用法是：
+
+```python
+from torch.utils.checkpoint import checkpoint
+
+class CheckpointedNetwork(nn.Module):
+    def __init__(self, layers):
+        super().__init__()
+        self.layers = nn.ModuleList(layers)
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = checkpoint(layer, x, use_reentrant=False)
+        return x
+```
+
+[PyTorch 官方文档](https://docs.pytorch.org/docs/stable/checkpoint.html)建议显式传入 `use_reentrant=False`。检查点函数在反向时重新运行前向片段，因此被检查的函数在两次执行中必须保持一致；如果它依赖可变的全局状态，可能得到错误梯度。
+
+不同保存策略的数量级可以这样理解：
+
+| 策略 | 激活存储 | 额外重算 | 直觉 |
+| --- | --- | --- | --- |
+| 保存每层激活 | $O(L)$ | 几乎没有 | 最快，但最占显存 |
+| 什么都不保存、从头重算 | $O(1)$ | 最坏可到 $O(L^2)$ | 省内存，但重复太多 |
+| 每隔约 $\sqrt L$ 层保存 | $O(\sqrt L)$ | $O(L)$ | 内存和计算的经典折中 |
+
+实践中通常按 Transformer block 或若干 block 为一段，具体颗粒度要通过峰值显存和吞吐实测。还要注意：如果前向含 dropout 等随机运算，检查点实现通常会保存并恢复随机数生成器状态，保证重算与原前向一致；这个过程也有开销。只有确认不需要保持随机行为时，才应考虑关闭 RNG 状态保存。
+
+### 梯度累积和激活检查点怎么选
+
+两者经常一起使用，但解决的问题不同：
+
+| 方法 | 改变什么 | 不改变什么 | 典型代价 |
+| --- | --- | --- | --- |
+| 梯度累积 | 每次处理的 microbatch 大小 | 有效 batch、模型状态大小 | 更多小型前向/反向，吞吐可能降低 |
+| 激活检查点 | 保存的中间激活数量 | batch 语义、模型状态大小 | 反向阶段重算部分前向 |
+| 状态分片 | 每张卡保存的参数/梯度/优化器状态 | 全局模型大小 | 通信和实现复杂度 |
+| 降低精度 | 每个值的字节数 | 张量元素数量 | 数值误差与缩放管理 |
+
+如果 OOM 主要来自 Adam 状态，继续减 microbatch 可能帮助有限；如果峰值随序列长度或 batch 快速增长，激活相关方法更有针对性。
+
+## 一套可复用的资源核算流程
+
+以后遇到“这个模型能不能跑”“为什么 GPU 没跑满”时，可以按以下顺序拆解。
+
+### 1. 写出关键张量形状
+
+先给每个轴命名，不要只记一串数字。确认广播、转置和归约后的形状，尤其关注 batch、sequence、heads、head dimension 和 vocabulary。
+
+### 2. 数显存，而不是只数参数
+
+分别估算：
+
+```text
+参数 + 梯度 + 优化器状态 + 激活 + 临时缓冲区
+```
+
+用 `numel × bytes_per_element` 得到理论下界，再为分配器、通信和工作区留余量。
+
+### 3. 数主要 FLOPs
+
+从大矩阵乘法开始，用 $2BDK$。训练时为参数梯度和输入梯度计入反向计算。再判断长上下文注意力等非参数主导项是否已经不可忽略。
+
+### 4. 实测时间并计算 MFU
+
+预热、同步、多次测量；使用与 dtype 和稠密/稀疏模式相对应的硬件峰值。不要把厂商宣传中的另一个精度峰值放进分母。
+
+### 5. 用算术强度判断瓶颈
+
+估算每搬一个字节做多少计算，与机器 balance point 比较：
+
+- memory-bound：优先减少数据搬运、融合算子、提高复用或批量；
+- compute-bound：优先使用更快的矩阵内核、合适形状和更低计算精度；
+- 都不像：检查 CPU、数据加载、内核启动、同步、通信或负载不均衡。
+
+### 6. 选择对症的换取关系
+
+- batch 激活太大：梯度累积；
+- 层间激活太大：激活检查点；
+- 模型状态太大：分片或卸载；
+- 数据流量太大：低精度、融合与更高复用；
+- 多卡等待严重：检查通信量、并行策略和重叠。
+
+## 常见误区
+
+### “显存能装下参数，就能训练”
+
+推理时也许接近成立，训练时远远不够。梯度、Adam 的两份 FP32 状态和激活都可能与参数同量级或更大。
+
+### “换成 BF16，所有东西都会减半”
+
+参数与激活可能减半，但优化器状态常保留 FP32，某些算子和缓冲区也不会跟着变。应逐项计算，而不是把整个进程显存直接除以二。
+
+### “GPU 利用率 100%，所以已经达到峰值”
+
+GPU 可以一直运行低吞吐、带宽受限的小内核。是否接近峰值，要看实际 FLOP/s、带宽和 MFU，而不是单个活动百分比。
+
+### “FLOPs 少的算子一定快”
+
+逐元素 ReLU 计算很少，却要完整读写张量，可能被内存流量支配。算术强度比 FLOPs 总数更能解释这类瓶颈。
+
+### “梯度累积等于更大的物理 batch”
+
+对普通逐样本 loss 和恰当缩放，它能匹配大 batch 梯度；但 BatchNorm、随机性、按 microbatch 变化的正则项，以及不等长 token 批次都可能让二者不完全等价。
+
+### “激活检查点一定能省很多显存”
+
+小模型、短网络或分配器缓存可能让进程面板上的变化不明显。检查点只减少可丢弃的激活；参数、梯度和优化器状态不会因此变小。
+
+## 自测题
+
+### 1. 一个 `[8, 2048, 4096]` 的 BF16 激活约多大
+
+元素数为 $8\times2048\times4096=67{,}108{,}864$，每个元素 2 B，共 128 MiB。反向实际需要保存哪些张量取决于算子，不能把这一项直接当成整层峰值。
+
+### 2. 为什么矩阵—向量乘常比大矩阵乘法更受带宽限制
+
+权重矩阵在一次调用中复用很少：读入一个权重通常只贡献一次乘加。大矩阵乘法能让同一数据块服务很多行和列，因此每字节完成更多 FLOPs。
+
+### 3. 四次 microbatch 累积时，为什么常把每次 mean loss 除以 4
+
+`.backward()` 会累积梯度。四个 microbatch 的平均梯度直接相加会放大四倍；每次除以 4，累积结果才等于完整 batch 的 mean loss 梯度。
+
+### 4. 30B 参数、Adam、BF16 参数与梯度，模型状态理论下界是多少
+
+按每参数 12 B 估算：
+
+$$
+30\times10^9\times12\text{ B}=360\text{ GB}.
+$$
+
+这还没算激活和其他开销。
+
+### 5. 算子强度是 100 FLOPs/B，机器临界值是 300 FLOPs/B，理想 MFU 上限是多少
+
+按 Roofline：
+
+$$
+\min(1,100/300)=1/3.
+$$
+
+即使内核完美，也只能达到约 33.3% 的计算峰值，因为先撞到带宽上限。
+
+## 最后的心智模型
+
+第二讲把 PyTorch 入门和系统性能放在一起，是因为二者本来就不该分开：
+
+- `shape` 决定运算规模；
+- `dtype` 决定数值行为与每元素字节；
+- `device` 决定数据在哪里，以及是否要传输；
+- autograd 决定要保存哪些激活并执行哪些反向运算；
+- optimizer 决定除了参数和梯度还要长期保存什么；
+- 算术强度决定硬件更可能在等计算还是等数据。
+
+因此，在实现训练代码时，不妨始终问三句话：
+
+1. **我在保存什么？** —— 对应容量与峰值显存；
+2. **我在计算什么？** —— 对应 FLOPs 与低精度吞吐；
+3. **我在搬运什么？** —— 对应带宽、融合和数据复用。
+
+当这三类成本都能被明确写出来，很多“玄学调参”就会变成可以验证的工程判断。
+
+## 资料与延伸阅读
+
+- [第二讲中文视频（Bilibili P2）](https://www.bilibili.com/video/BV11LEA6eEuj/?p=2)
+- [Stanford CS336 第二讲可执行讲义](https://cs336.stanford.edu/lectures/?trace=lecture_02)
+- [第二讲 Python 源码](https://github.com/stanford-cs336/lectures/blob/main/lecture_02.py)
+- [CS336 课程与讲义仓库](https://github.com/stanford-cs336/lectures)
+- [einops 官方教程](https://einops.rocks/1-einops-basics/)
+- [PyTorch 自动混合精度文档](https://docs.pytorch.org/docs/stable/accelerator/amp.html)
+- [PyTorch：清空梯度](https://docs.pytorch.org/tutorials/recipes/recipes/zeroing_out_gradients.html)
+- [PyTorch：激活检查点](https://docs.pytorch.org/docs/stable/checkpoint.html)
+- [JAX Scaling Book：Roofline](https://jax-ml.github.io/scaling-book/roofline/)
+
+如果想把第一、二讲落实到代码，可以继续阅读[《Karpathy Tokenizer 视频笔记》](/posts/karpathy-build-gpt-tokenizer)和[《CS336 train_bpe 实战：从正确实现到 3.5 倍性能优化》](/posts/cs336-train-bpe-performance)。

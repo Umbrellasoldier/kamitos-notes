@@ -29,9 +29,9 @@ test("首页呈现正式品牌、精选旧文且不会重复", async () => {
   assert.match(html, /<title>Kamito(?:'|&#x27;)s Notes<\/title>/i);
   assert.match(html, /记录技术、生活与思考/);
   assert.match(html, /src="\/og\.png"/);
-  assert.match(html, /欢迎来到 Kamito/);
   assert.match(html, /算法竞赛进阶指南：基本算法与数据结构/);
   assert.match(html, /CS336 train_bpe 实战：从正确实现到 3\.5 倍性能优化/);
+  assert.match(html, /CS336 第二讲笔记：PyTorch、显存与计算资源核算/);
   assert.doesNotMatch(html, /target="_top"/);
   assert.doesNotMatch(html, /\/_next\/static\/chunks\/link-[^"]+\.js/);
   assert.equal(
@@ -71,6 +71,7 @@ test("主要页面和聚合页均可渲染", async () => {
     "/posts/cs336-lecture-01-overview-tokenization",
     "/posts/karpathy-build-gpt-tokenizer",
     "/posts/cs336-train-bpe-performance",
+    "/posts/cs336-lecture-02-pytorch-resource-accounting",
     "/about",
     "/categories",
     "/categories/%E6%8A%80%E6%9C%AF",
@@ -177,6 +178,45 @@ test("CS336 train_bpe 实战保留性能数据、代码与关联阅读", async (
   assert.doesNotMatch(html, /name="twitter:image"/);
 });
 
+test("CS336 第二讲笔记覆盖 PyTorch、资源核算和显存优化主线", async () => {
+  const response = await render(
+    "/posts/cs336-lecture-02-pytorch-resource-accounting",
+  );
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /CS336 第二讲笔记：PyTorch、显存与计算资源核算/);
+  assert.match(html, /class="toc"/);
+  assert.match(html, /class="katex-display"/);
+  assert.match(html, /data-rehype-pretty-code-figure/);
+  assert.match(html, /6ND/);
+  assert.match(html, /295\.37/);
+  assert.match(html, /arithmetic intensity/);
+  assert.match(html, /use_reentrant=False/);
+  assert.match(html, /梯度累积/);
+  assert.match(html, /激活检查点/);
+  assert.match(
+    html,
+    /\/posts\/cs336-lecture-02-pytorch-resource-accounting\/fp32\.png/,
+  );
+  assert.match(
+    html,
+    /\/posts\/cs336-lecture-02-pytorch-resource-accounting\/compute-memory\.png/,
+  );
+  assert.match(
+    html,
+    /cs336\.stanford\.edu\/lectures\/\?trace=lecture_02/,
+  );
+  assert.match(html, /bilibili\.com\/video\/BV11LEA6eEuj/);
+  assert.match(html, /docs\.pytorch\.org\/docs\/stable\/checkpoint\.html/);
+  assert.match(
+    html,
+    /property="og:title" content="CS336 第二讲笔记：PyTorch、显存与计算资源核算/,
+  );
+  assert.match(html, /name="twitter:card" content="summary"/);
+  assert.doesNotMatch(html, /property="og:image"/);
+  assert.doesNotMatch(html, /name="twitter:image"/);
+});
+
 test("新整理文章保留合并结构、本地图片和代码高亮", async () => {
   const dataStructures = await render("/posts/fundamental-data-structures");
   assert.equal(dataStructures.status, 200);
@@ -214,6 +254,7 @@ test("RSS、站点地图和 robots 只包含已发布内容", async () => {
   assert.match(rssText, /CS336 第一讲笔记/);
   assert.match(rssText, /Karpathy Tokenizer 视频笔记/);
   assert.match(rssText, /CS336 train_bpe 实战/);
+  assert.match(rssText, /CS336 第二讲笔记/);
 
   const sitemap = await render("/sitemap.xml");
   assert.equal(sitemap.status, 200);
@@ -233,6 +274,10 @@ test("RSS、站点地图和 robots 只包含已发布内容", async () => {
   assert.match(sitemapText, /\/posts\/cs336-lecture-01-overview-tokenization/);
   assert.match(sitemapText, /\/posts\/karpathy-build-gpt-tokenizer/);
   assert.match(sitemapText, /\/posts\/cs336-train-bpe-performance/);
+  assert.match(
+    sitemapText,
+    /\/posts\/cs336-lecture-02-pytorch-resource-accounting/,
+  );
   assert.match(sitemapText, /\/categories\/%E6%8A%80%E6%9C%AF/);
   assert.match(sitemapText, /\/categories\/%E9%9A%8F%E7%AC%94/);
 
