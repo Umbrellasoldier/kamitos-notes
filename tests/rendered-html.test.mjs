@@ -276,6 +276,13 @@ test("Kimi K3 长文从 Transformer 基础覆盖到架构、后训练和系统",
   assert.match(html, /2\.5 倍/);
   assert.match(html, /896 个 routed experts/);
   assert.match(html, /1,048,576 token/);
+  assert.match(html, /阅读地图：把视频时间轴对齐到技术报告/);
+  assert.match(html, /先清洗术语：自动转写最容易错在哪里/);
+  assert.match(html, /YOCO-U/);
+  assert.match(html, /parallel delta rule/);
+  assert.match(html, /解读视频补充的六条研究脉络/);
+  assert.match(html, /报告事实/);
+  assert.match(html, /视频观点/);
   assert.match(
     html,
     /\/posts\/kimi-k3-architecture-from-zero\/architecture\.png/,

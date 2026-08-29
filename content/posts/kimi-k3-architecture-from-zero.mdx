@@ -2,6 +2,7 @@
 title: "从 Transformer 到 Kimi K3：零基础读懂 2.8T MoE、混合注意力与 Agent 训练"
 description: "从 token、Transformer、注意力和 MoE 开始，逐层拆解 Kimi K3 的 KDA、Attention Residuals、Stable LatentMoE、原生多模态、Agentic RL 与万亿参数基础设施。"
 publishedAt: "2026-08-29"
+updatedAt: "2026-08-29"
 category: "技术"
 tags:
   - "Kimi K3"
@@ -21,9 +22,28 @@ draft: false
 2. 为什么这些模块需要组合，而不是单独存在？
 3. 哪些是可以从报告直接得到的事实，哪些仍是需要外部复现的工程主张？
 
-本文以 [Kimi K3 官方技术报告](https://arxiv.org/abs/2607.24653)、[官方代码与模型仓库](https://github.com/MoonshotAI/Kimi-K3)和[官方发布说明](https://www.kimi.com/news/kimi-k3)为事实基准，并参考这期[中文解读视频](https://www.bilibili.com/video/BV1KZ8X6uEPL)。我对 2 小时 4 分 20 秒的完整音轨做了本地转写，并按时间戳检索嘉宾的论证；自动转写中的英文术语则回到报告和相关论文校正。视频用于补充研究视角，架构数字、公式和实验结论仍以官方材料为准。
+本文以 [Kimi K3 官方技术报告](https://arxiv.org/abs/2607.24653)、[官方代码与模型仓库](https://github.com/MoonshotAI/Kimi-K3)和[官方发布说明](https://www.kimi.com/news/kimi-k3)为事实基准，并参考这期[中文解读视频](https://www.bilibili.com/video/BV1KZ8X6uEPL)。我对 2 小时 4 分 20 秒的完整音轨做了本地转写：以 Qwen3-ASR 为主稿，用 Whisper 交叉定位疑难片段，再把专名逐项放回报告和相关论文核对。清洗只修正能够被一手来源唯一锚定的术语，不确定口语不会被猜写进结论。
+
+全文刻意区分三种证据：**报告事实**是 K3 团队公开写下的数字、方法和实验；**视频观点**是嘉宾对技术路线的判断；**本文解释**是为了帮助初学者理解而使用的类比和推导。视频能解释“研究者为什么这样看”，但不能替代报告证明“系统实际上怎样实现”。
 
 如果你已经读过我的[《CS336 第一讲笔记：从课程全景到 BPE 分词》](/posts/cs336-lecture-01-overview-tokenization)和[《CS336 Transformer 从零实现》](/posts/cs336-transformer-from-scratch)，前四章会是复习；如果没有，直接从这里开始也没有问题。
+
+## 阅读地图：把视频时间轴对齐到技术报告
+
+视频按研究脉络讲，报告按系统组件写。下面这张表把二者对齐；时间是根据完整音轨整理的章节边界，不是逐字稿的精确句号。
+
+| 视频时间 | 主要内容 | 报告或论文锚点 | 本文对应部分 |
+| --- | --- | --- | --- |
+| 01:59–19:02 | RetNet、YOCO、YOCO-U：从线性注意力到层间共享 KV cache | RetNet、YOCO、YOCO-U 原论文 | KDA 前置脉络、视频研究视角 |
+| 19:02–21:30 | K3 的规模与三维 scaling | 摘要、§2、Table 1 | “先看结论”“总设计” |
+| 21:30–39:17 | KDA、lower-bounded decay、Gated MLA | §2.1 | “深入一”“深入二” |
+| 39:17–46:24 | DenseNet、Hyper-Connections、Attention Residuals | §2.2 与相关论文 | “深入三” |
+| 46:24–62:14 | Stable LatentMoE、SiTU-GLU、Quantile Balancing | §2.3、Appendix C | “深入四” |
+| 62:14–72:39 | MoonViT-V2、稀疏注意力取舍、架构综合 | §2.4；部分为视频观点 | “原生视觉”“视频研究视角” |
+| 72:49–82:21 | 预训练、cosine decay、scaling law、NoPE | §3 | “预训练” |
+| 82:21–93:38 | OPD/MOPD、量化感知训练、推测解码 | §4 | “后训练” |
+| 93:38–114:59 | KDA Context Parallelism、MoonEP、训练与服务系统 | §5 | “基础设施” |
+| 114:59–124:20 | 评测、团队与未来判断 | §6–§10；结尾多为视频观点 | “评测”“信息边界” |
 
 ## 先看结论：Kimi K3 到底是什么
 
@@ -770,27 +790,66 @@ K3 报告专门评估网络安全能力。报告称，在人工审查的候选�
 
 lower-bounded KDA 是为了 Tensor Core；Block AttnRes 是为了激活和 pipeline 通信；QAT 从 SFT 开始；prefix cache 同时理解 MLA 和 KDA。架构如果不能被内核高效实现，就很难在万亿参数和百万上下文下成立。
 
-## 解读视频补充的三个视角
+## 先清洗术语：自动转写最容易错在哪里
 
-下面三点来自视频中的讨论和嘉宾判断，不是 K3 报告已经证明的结论。把二者分开，反而更容易理解“论文写了什么”和“研究者如何评价它”。时间戳来自完整音轨的本地转写。
+技术访谈里的英文缩写密度很高，同一个错误还可能被模型写成几种汉字。下面列出会改变技术含义的关键错词；普通口头重复、语气词和不影响含义的语病没有被强行改成书面语。
 
-### 1. 架构研究正在从“性能优先”转向“效率优先”（03:10–03:57）
+| 自动转写中的写法 | 清洗后的术语 | 判断依据 |
+| --- | --- | --- |
+| UQ、UQO、优酷 | YOCO（You Only Cache Once） | YOCO 原论文的共享 KV cache 架构 |
+| UQO Universal | YOCO-U | YOCO-U 原论文的通用深度扩展版本 |
+| Pull Don't Read | parallel delta rule | Delta rule 并行化论文的正式名称 |
+| K T 的 MLA | Gated MLA | K3 报告 §2.1 |
+| GPT 的 attention、gating tension | Gated Attention | Qwen 团队论文标题与 K3 报告引用 |
+| Tensor Residual、部分 Tensor Core | Attention Residuals / AttnRes | 这些片段正在讨论报告 §2.2 的深度连接 |
+| C2GROU、C2JL | SiTU-GLU | K3 报告 §2.3.2 |
+| 状态 balancing、Quantile Biasing | Quantile Balancing（QB） | K3 报告 §2.3.3 与 Appendix C |
+| Moon、MoonClip | Muon、MuonClip | K3/K2 的优化器与稳定化机制 |
+| out-of-order / auto dispatch | all-to-all dispatch | MoE 专家并行通信语境 |
+| DPEP、dope | DeepEP、DualPipe | 只在通信库和流水线调度语境中这样修正 |
+| 微生引扣的、VLM | vision encoder、vLLM | 分别对应视觉编码器与推理引擎语境 |
 
-嘉宾的观察是：在 ImageNet 时代，一个精巧模块可能凭精度提升成为主角；到大模型时代，扩大参数和数据通常更直接地提升能力，而架构之间的推理成本、显存占用和部署价格却可能相差很大。因此，架构创新越来越需要回答“同样能力能否更便宜地训练和服务”。
+这张表也解释了为什么不能只对逐字稿做全文字符串替换。例如 “Moon” 有时是 Muon，有时又是 MoonEP 或 MoonViT；“VLM” 既可能是 vision-language model，也可能是被误写的 vLLM。清洗必须同时看时间位置、上下文和一手材料。
 
-这正是阅读 KDA、LatentMoE 和 Block AttnRes 的合适入口：它们不是孤立追求一个更漂亮的公式，而是在长上下文、稀疏扩展和深层网络下重新分配计算、显存与通信。
+## 解读视频补充的六条研究脉络
 
-### 2. MLA 是否适合未来 Agent，并没有形成共识（36:14–39:12）
+下面内容整理自视频。每条都明确指出它属于报告事实、外部论文背景还是嘉宾判断，避免把“研究者如何评价它”误写成“K3 报告已经证明了它”。
+
+### 1. 从 RetNet 到 YOCO-U：效率研究先拆解推理瓶颈（01:59–19:02）
+
+视频先回顾嘉宾参与的三条工作线。[RetNet](https://www.microsoft.com/en-us/research/publication/retentive-network-a-successor-to-transformer-for-large-language-models/)把 retention 写成 parallel、recurrent 和 chunkwise recurrent 三种等价计算形式；[YOCO](https://arxiv.org/abs/2405.05254)沿深度方向只保留一份共享 KV cache，并允许 prefill 提前退出部分计算；[YOCO-U](https://arxiv.org/abs/2604.01220)再讨论如何用高效循环单元扩展推理深度。
+
+这段是理解问题来源的**外部论文背景**，不是说 K3 内部使用了 YOCO。它给出的阅读方法是：不要只问“复杂度是不是线性”，还要分别核算 prefill、decode 和 KV cache，检查一个方案究竟省了哪一种成本。
+
+### 2. KDA 是算法与 kernel 的共同设计（21:30–33:14）
+
+视频从 RetNet、Mamba、DeltaNet 和 Gated DeltaNet 一路推到 KDA，并提到将 delta rule 变成 GPU 可并行 chunkwise 形式的 [parallel delta rule](https://arxiv.org/abs/2406.06484)。这条历史线帮助理解 KDA 不是凭空出现的公式，而是在状态容量、衰减方式和 GPU 计算模式之间逐步演化。
+
+**报告事实**是：K3 的 lower-bounded decay 不只是“让模型别忘得太快”。它把 16-token tile 内 reciprocal cumulative decay 的范围限制在 BF16 可表示区间，使 chunk 内密集运算可以使用 Tensor Core。视频把这种关系概括为 co-design；报告 §2.1.1 和 Figure 3 给出了具体机制。
+
+### 3. MLA 是否适合未来 Agent，并没有形成共识（36:14–39:12）
 
 视频专门讨论了 MLA 的收益是否也能由更合适的 GQA/MQA 配置取得，以及稀疏注意力、prefill 成本和 Agent 工作负载会不会改变选择。这里最重要的不是接受某个预测，而是看到设计目标之间的张力：压缩 KV cache、增加计算、保留全局检索和适应超长交互，并不总能同时最优。
 
-K3 的实际选择是保留周期性的 Gated MLA，并让 KDA 承担大部分层。这说明 K3 不是在宣告“MLA 永远正确”，而是在当前训练和系统约束下采用一种混合解；它在未来是否仍最优，需要新的负载、消融和部署数据回答。
+**报告事实**是 K3 保留 24 层周期性 Gated MLA，并让 69 层 KDA 承担大部分序列混合。至于 MLA 在下一代 Agent 负载中是否仍然最优，是视频中的**前瞻判断**，需要新的消融和部署数据验证。
 
-### 3. 今天的 Transformer 更像“忒修斯之船”（68:08–70:23）
+### 4. AttnRes 延续了“深层如何取回浅层信息”的研究线（39:17–46:24）
 
-视频用“忒修斯之船”描述架构演化：2017 年的注意力、残差和层堆叠不断被替换、门控、压缩、稀疏化和重新连接，我们仍把成品称为 Transformer，但其内部已经变化很大。K3 也更像一项系统综合工程，而不是靠单个模块完成范式跳跃。
+视频把 [DenseNet](https://arxiv.org/abs/1608.06993)、[Hyper-Connections](https://arxiv.org/abs/2409.19606)、[mHC](https://arxiv.org/abs/2512.24880) 与 [Attention Residuals](https://arxiv.org/abs/2603.15031) 放在同一条连接设计脉络中：标准残差只把历史压进一个累计状态，更宽的 residual stream 或对历史层做注意力检索，则能增加深度方向的信息容量。
 
-这不等于“没有创新”。更准确的判断是：单点想法、规模验证、数据配方、数值稳定性、并行内核和线上服务必须共同成立，完整模型才有意义。也因此，K3 的整体效果不能被轻易归因给某一个缩写；这与下一节列出的公开信息边界是一致的。
+这里要分开两层结论。K3 报告确认模型使用 Block AttnRes，并说明它降低了 Full AttnRes 的存储和跨流水线通信成本；“哪项工作创新性最强”则是嘉宾的个人评价，不是报告消融。
+
+### 5. 架构研究正在从“性能优先”转向“效率优先”（03:10–03:57；46:24–114:59）
+
+嘉宾的观察是：到大模型时代，扩大参数和数据通常更直接地提升能力，而不同架构的推理成本、显存占用和部署价格却可能相差很大。因此，架构创新越来越需要回答“同样能力能否更便宜地训练和服务”。
+
+K3 报告为这条观点提供了大量**工程实例**：LatentMoE 先压缩被 all-to-all dispatch 的 hidden state；KDA Context Parallelism 通过 prefix scan 组合固定大小状态；MoonEP 在线规划冗余专家；Block AttnRes、激活 offload 和混合 prefix cache 都同时考虑数学结构与系统代价。它们不是一个独立公式带来的胜利，而是一组互相约束的实现选择。
+
+### 6. 今天的 Transformer 更像“忒修斯之船”（68:08–70:23）
+
+视频用“忒修斯之船”描述架构演化：2017 年的注意力、残差和层堆叠不断被门控、压缩、稀疏化和重新连接，我们仍把成品称为 Transformer，但其内部已经变化很大。K3 也更像一项系统综合工程，而不是靠单个模块完成范式跳跃。
+
+这不等于“没有创新”。更准确的判断是：单点想法、规模验证、数据配方、数值稳定性、并行内核和线上服务必须共同成立，完整模型才有意义。嘉宾在结尾关于“未来是否还会有本质创新”的说法属于**个人预测**；本文不把它改写成已经发生的行业事实。
 
 ## 报告没有完全回答什么
 
@@ -886,12 +945,19 @@ K3 的实际选择是保留周期性的 Gated MLA，并让 KDA 承担大部分�
 - [MoonshotAI/Kimi-K3](https://github.com/MoonshotAI/Kimi-K3)：官方模型仓库、配置和许可证。
 - [Hugging Face 模型页](https://huggingface.co/moonshotai/Kimi-K3)：模型文件与使用说明。
 - [Attention Is All You Need](https://arxiv.org/abs/1706.03762)：Transformer 基础。
+- [Retentive Network](https://www.microsoft.com/en-us/research/publication/retentive-network-a-successor-to-transformer-for-large-language-models/)：parallel、recurrent 与 chunkwise recurrent 三种计算视图。
+- [YOCO: You Only Cache Once](https://arxiv.org/abs/2405.05254)：视频前半段“层间共享一份 KV cache”的正式来源。
+- [YOCO-U](https://arxiv.org/abs/2604.01220)：在 YOCO 基础上讨论高效深度扩展。
+- [Parallelizing Linear Transformers with the Delta Rule](https://arxiv.org/abs/2406.06484)：视频中被误转写为 “Pull Don't Read” 的 parallel delta rule。
 - [Kimi Linear](https://arxiv.org/abs/2510.26692)：KDA 与 MLA 混合架构的直接前身。
 - [Gated Delta Networks](https://arxiv.org/abs/2412.06464)：delta-rule 线性注意力的重要背景。
 - [Gated Attention for Large Language Models](https://arxiv.org/abs/2505.06708)：注意力输出门控的背景。
 - [Attention Residuals](https://arxiv.org/abs/2603.15031)：深度方向信息检索。
+- [Hyper-Connections](https://arxiv.org/abs/2409.19606) 与 [mHC](https://arxiv.org/abs/2512.24880)：视频讨论的 residual-stream 扩展脉络。
 - [LatentMoE](https://arxiv.org/abs/2601.18089)：在低维 latent space 扩展专家容量。
 - [Muon is Scalable for LLM Training](https://arxiv.org/abs/2502.16982)：Muon 在大模型上的扩展研究。
+- [MiniLLM](https://arxiv.org/abs/2306.08543)：on-policy distillation 的重要背景。
+- [DFlash](https://arxiv.org/abs/2602.06036)：视频后训练部分提到的 block-diffusion speculative decoding。
 - [DeepSeek-V3 Technical Report](https://arxiv.org/abs/2412.19437)：MoE、无辅助损失负载均衡与系统设计背景。
 - [Kimi K2.5 Technical Report](https://arxiv.org/abs/2602.02276)：K3 后训练、Agent 和多模态路线的前身。
 - [中文解读视频](https://www.bilibili.com/video/BV1KZ8X6uEPL)：适合在理解上述主线后回看，用于建立模块之间的口头叙事。
