@@ -74,6 +74,7 @@ test("主要页面和聚合页均可渲染", async () => {
     "/posts/cs336-train-bpe-performance",
     "/posts/cs336-lecture-02-pytorch-resource-accounting",
     "/posts/cs336-transformer-from-scratch",
+    "/posts/kimi-k3-architecture-from-zero",
     "/about",
     "/categories",
     "/categories/%E6%8A%80%E6%9C%AF",
@@ -257,6 +258,53 @@ test("CS336 第二讲笔记覆盖 PyTorch、资源核算和显存优化主线", 
   assert.doesNotMatch(html, /name="twitter:image"/);
 });
 
+test("Kimi K3 长文从 Transformer 基础覆盖到架构、后训练和系统", async () => {
+  const response = await render("/posts/kimi-k3-architecture-from-zero");
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(
+    html,
+    /从 Transformer 到 Kimi K3：零基础读懂 2\.8T MoE、混合注意力与 Agent 训练/,
+  );
+  assert.match(html, /class="toc"/);
+  assert.match(html, /class="katex-display"/);
+  assert.match(html, /data-rehype-pretty-code-figure/);
+  assert.match(html, /Kimi Delta Attention/);
+  assert.match(html, /Attention Residuals/);
+  assert.match(html, /Stable LatentMoE/);
+  assert.match(html, /Multi-Teacher On-Policy Distillation/);
+  assert.match(html, /2\.5 倍/);
+  assert.match(html, /896 个 routed experts/);
+  assert.match(html, /1,048,576 token/);
+  assert.match(
+    html,
+    /\/posts\/kimi-k3-architecture-from-zero\/architecture\.png/,
+  );
+  assert.match(
+    html,
+    /\/posts\/kimi-k3-architecture-from-zero\/kda-bounded-decay\.png/,
+  );
+  assert.match(
+    html,
+    /\/posts\/kimi-k3-architecture-from-zero\/quantile-balancing\.png/,
+  );
+  assert.match(
+    html,
+    /\/posts\/kimi-k3-architecture-from-zero\/prefix-cache\.png/,
+  );
+  assert.match(html, /arxiv\.org\/abs\/2607\.24653/);
+  assert.match(html, /github\.com\/MoonshotAI\/Kimi-K3/);
+  assert.match(html, /bilibili\.com\/video\/BV1KZ8X6uEPL/);
+  assert.match(html, /href="\/posts\/cs336-transformer-from-scratch"/);
+  assert.match(
+    html,
+    /property="og:title" content="从 Transformer 到 Kimi K3/,
+  );
+  assert.match(html, /name="twitter:card" content="summary"/);
+  assert.doesNotMatch(html, /property="og:image"/);
+  assert.doesNotMatch(html, /name="twitter:image"/);
+});
+
 test("新整理文章保留合并结构、本地图片和代码高亮", async () => {
   const dataStructures = await render("/posts/fundamental-data-structures");
   assert.equal(dataStructures.status, 200);
@@ -296,6 +344,7 @@ test("RSS、站点地图和 robots 只包含已发布内容", async () => {
   assert.match(rssText, /CS336 train_bpe 实战/);
   assert.match(rssText, /CS336 第二讲笔记/);
   assert.match(rssText, /CS336 Transformer 从零实现/);
+  assert.match(rssText, /从 Transformer 到 Kimi K3/);
 
   const sitemap = await render("/sitemap.xml");
   assert.equal(sitemap.status, 200);
@@ -320,6 +369,7 @@ test("RSS、站点地图和 robots 只包含已发布内容", async () => {
     /\/posts\/cs336-lecture-02-pytorch-resource-accounting/,
   );
   assert.match(sitemapText, /\/posts\/cs336-transformer-from-scratch/);
+  assert.match(sitemapText, /\/posts\/kimi-k3-architecture-from-zero/);
   assert.match(sitemapText, /\/categories\/%E6%8A%80%E6%9C%AF/);
   assert.match(sitemapText, /\/categories\/%E9%9A%8F%E7%AC%94/);
 

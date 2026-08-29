@@ -1,0 +1,877 @@
+---
+title: "从 Transformer 到 Kimi K3：零基础读懂 2.8T MoE、混合注意力与 Agent 训练"
+description: "从 token、Transformer、注意力和 MoE 开始，逐层拆解 Kimi K3 的 KDA、Attention Residuals、Stable LatentMoE、原生多模态、Agentic RL 与万亿参数基础设施。"
+publishedAt: "2026-08-29"
+category: "技术"
+tags:
+  - "Kimi K3"
+  - "大语言模型"
+  - "Transformer"
+  - "MoE"
+  - "AI Agent"
+featured: false
+draft: false
+---
+
+如果你第一次打开 Kimi K3 技术报告，最容易产生的感受可能不是“这个模块我不懂”，而是“每一页都同时出现十个我不懂的词”：KDA、MLA、MoE、AttnRes、Muon、RL、MOPD、KV cache、context parallelism……它们横跨模型架构、训练算法、GPU 系统和 Agent 工程，彼此还会相互影响。
+
+这篇文章不要求你预先懂深度学习。我会先回答“语言模型究竟在做什么”，再搭出 Transformer、注意力、MoE、多模态和 Agent 的基础框架，最后逐层拆解 Kimi K3。读完后，你应该不仅能复述报告中的缩写，还能回答三个更重要的问题：
+
+1. K3 的每项设计究竟在解决什么瓶颈？
+2. 为什么这些模块需要组合，而不是单独存在？
+3. 哪些是可以从报告直接得到的事实，哪些仍是需要外部复现的工程主张？
+
+本文以 [Kimi K3 官方技术报告](https://arxiv.org/abs/2607.24653)、[官方代码与模型仓库](https://github.com/MoonshotAI/Kimi-K3)和[官方发布说明](https://www.kimi.com/news/kimi-k3)为事实基准，并参考这期[中文解读视频](https://www.bilibili.com/video/BV1KZ8X6uEPL)。视频页面没有提供无需登录即可读取的完整字幕，因此它在本文中主要充当“问题导航”；架构数字、公式和实验结论均回到官方报告核对。
+
+如果你已经读过我的[《CS336 第一讲笔记：从课程全景到 BPE 分词》](/posts/cs336-lecture-01-overview-tokenization)和[《CS336 Transformer 从零实现》](/posts/cs336-transformer-from-scratch)，前四章会是复习；如果没有，直接从这里开始也没有问题。
+
+## 先看结论：Kimi K3 到底是什么
+
+Kimi K3 是一个**原生多模态、稀疏激活、面向长上下文和长程 Agent 任务训练的基础模型**。它的主要规模参数是：
+
+| 项目 | Kimi K3 | 这意味着什么 |
+| --- | ---: | --- |
+| 总参数量 | 2.78T，约 2.8 万亿 | 所有专家和公共模块的权重总和 |
+| 每个 token 激活参数 | 104.2B，约 1040 亿 | 单次前向不会使用全部 2.8T 参数 |
+| 主干层数 | 93 层 | 比 Kimi K2 的 61 层更深 |
+| 隐藏维度 | 7,168 | 每个 token 在主干中的向量宽度 |
+| 注意力组成 | 69 层 KDA + 24 层 Gated MLA | 大约每三层 KDA 插入一层全局注意力 |
+| 注意力头 | 96 | 多组并行的“检索视角” |
+| 路由专家 | 896 个 | 每个 token 选择其中 16 个 |
+| 共享专家 | 2 个 | 所有 token 都会经过 |
+| 词表 | 160K | 文本 token 的候选集合 |
+| 上下文上限 | 1,048,576 token | 约一百万 token 的训练与服务目标 |
+| 视觉编码器 | 27 层、401M 参数 | 从头训练的 MoonViT-V2 |
+
+这里最需要立刻纠正两个常见误读：
+
+- **“2.8T”不是每生成一个 token 都计算 2.8T 参数。** MoE 路由只激活部分专家，所以报告给出的激活参数约为 104.2B。但所有权重仍要被存储、分片、加载和通信，2.8T 绝不等于“普通电脑可以轻松运行”。
+- **“效率提升 2.5 倍”不是生成速度提升 2.5 倍。** 报告说的是把验证损失对训练计算量拟合成 scaling-law 曲线后，K3 整体配方相对 K2 的 *scaling efficiency* 提升约 2.5 倍。它是架构、数据和训练配方的联合结果，不是单个 KDA 内核的吞吐倍率。
+
+可以先用一句话记住整份报告：
+
+> Kimi K3 在序列方向用 KDA 与 MLA 混合，在深度方向用 Attention Residuals，在宽度方向用 Stable LatentMoE，再用原生视觉、专门化 RL 教师和系统级优化，把一个 2.8T 稀疏模型变成可训练、可推理、可执行长程任务的 Agent 基座。
+
+下面我们从“模型为什么能说话”开始，一层层把这句话展开。
+
+## 第一层基础：语言模型本质上在预测下一个 token
+
+### 文字先被切成 token
+
+神经网络不能直接处理“架构”或“月之暗面”这样的文字。分词器先把文本转换为整数序列：
+
+```text
+"Kimi K3 learns"  →  [42117, 872, 19, 9341]
+```
+
+一个 token 不一定是一个汉字或一个英文单词：它可能是字、词的一部分、空格、标点或代码片段。模型拥有一个大小为 160K 的词表，最终要对 160K 个候选 token 给出概率。
+
+### 整个训练目标可以非常简单
+
+给定前缀 $x_1,x_2,\ldots,x_t$，模型预测下一个 token：
+
+$$
+p(x_{t+1}\mid x_1,\ldots,x_t).
+$$
+
+训练文本中的正确答案已经存在，所以可以计算负对数似然：
+
+$$
+\mathcal{L}=-\sum_t\log p(x_{t+1}\mid x_{\le t}).
+$$
+
+模型反复调整参数，让真实下一个 token 的概率变大。代码、数学推导、工具调用格式和视觉描述，都可以被序列化为这种“接下来应该是什么”的学习问题。
+
+### embedding：把编号变成向量
+
+整数编号本身没有距离意义。embedding 表把每个 token 映射成一个高维向量。K3 的主干隐藏维度是 7,168，所以可以粗略理解为：每个位置都带着一张包含 7,168 个浮点数的“工作卡片”。
+
+经过 93 层处理后，卡片不断吸收上下文信息。最后一层将它映射回 160K 维 logits，再用 softmax 变成下一个 token 的概率。
+
+## 第二层基础：一个 Transformer 层在做什么
+
+经典 Transformer 层有两类核心计算：
+
+1. **注意力（Attention）**：让一个 token 从其他 token 中取回相关信息，负责“token 之间交流”。
+2. **前馈网络（FFN/MLP）**：单独处理每个 token 的通道向量，负责“在一个位置内部计算”。
+
+它们外面还有残差连接和归一化：
+
+$$
+h' = h + \operatorname{Attention}(\operatorname{Norm}(h)),
+$$
+
+$$
+h_{\text{next}} = h' + \operatorname{FFN}(\operatorname{Norm}(h')).
+$$
+
+这两行非常重要。后面 K3 的三条创新主线，正好分别改造：
+
+- Attention 如何沿**序列**传递信息；
+- residual 如何沿**层数**传递信息；
+- FFN 如何沿**通道/专家**扩展容量。
+
+### Q、K、V：把注意力想成检索
+
+每个 token 的向量经过三组线性变换，得到 Query、Key、Value：
+
+- Query：我正在寻找什么？
+- Key：我这里有什么线索？
+- Value：如果你选中我，我要传给你什么内容？
+
+单个注意力头的核心公式是：
+
+$$
+\operatorname{Attention}(Q,K,V)
+=\operatorname{softmax}\left(\frac{QK^\top}{\sqrt{d_h}}+M\right)V,
+$$
+
+其中 $M$ 是因果掩码，禁止当前位置偷看未来 token。$QK^\top$ 会形成一个 $n\times n$ 的分数矩阵：序列中每个位置都能对以前的每个位置打分。
+
+这就是全注意力强大的原因，也是它昂贵的原因。当序列长度从 $n$ 翻倍到 $2n$，分数矩阵面积会从 $n^2$ 变成 $4n^2$。
+
+### 多头注意力不是重复计算
+
+模型把隐藏维度切成多个 head。不同 head 可以学习不同关系，例如指代、局部语法、代码变量依赖或跨段落引用。K3 有 96 个注意力头，但“一个头一定表示某种可命名语义”只是便于理解的比喻，不应当当作可验证定律。
+
+### 残差连接为什么重要
+
+没有残差时，第 $l$ 层只能拿到第 $l-1$ 层重新编码后的结果，训练很深的网络会更困难。残差允许新模块只学习一个增量：
+
+$$
+h_l=h_{l-1}+F_l(h_{l-1}).
+$$
+
+梯度也有一条近似“直通道路”。但标准残差有一个隐藏限制：所有历史层最终被压进同一个 $h_{l-1}$。K3 的 AttnRes 正是要放宽这个限制。
+
+## 第三层基础：推理、KV cache 和百万 token 的代价
+
+语言模型生成回答分两步：
+
+### Prefill：一次读完输入
+
+假设输入有 10,000 个 token，模型先并行处理这 10,000 个位置，建立中间表示和缓存。这个阶段矩阵较大，通常比较容易吃满 GPU 算力。
+
+### Decode：一个一个生成
+
+随后模型生成第 10,001 个 token，再把它作为输入生成第 10,002 个。每一步都依赖上一步，序列方向无法完全并行：
+
+```python
+cache = prefill(prompt_tokens)
+
+while not finished:
+    logits, cache = decode_one_token(last_token, cache)
+    last_token = sample(logits)
+```
+
+在全注意力中，历史 token 的 Key 和 Value 可以预先保存，这就是 **KV cache**。每次生成只计算新 token 的 Q、K、V，再让新 Q 查询历史 K/V，不必重算整个前缀。
+
+问题是 KV cache 随上下文长度线性增长。模型层数、batch、序列长度、KV head 数和 head 维度都会放大它。上下文从 128K 扩到 1M，不只是配置文件中多写一个零；显存、带宽、跨卡通信、缓存命中和请求调度都会变成系统问题。
+
+## 第四层基础：Dense、MoE 与“总参数/激活参数”
+
+### 稠密 FFN
+
+普通 Transformer 的每个 token 都通过同一套 FFN。模型变宽时，每个 token 的计算量也一起变大。
+
+### Mixture-of-Experts
+
+MoE 把一套 FFN 换成很多“专家”，并增加一个 router：
+
+$$
+s=\operatorname{Router}(h),\qquad
+\mathcal{E}=\operatorname{TopK}(s),
+$$
+
+$$
+y=\sum_{i\in\mathcal{E}}p_iE_i(h).
+$$
+
+如果有 896 个专家，但每个 token 只选 16 个，就能增加总容量而不让每个 token 计算全部专家。可以把它想成一本巨大的专业图书馆：馆藏很多，但每次问题只送去少数相关阅览室。
+
+### MoE 不是免费午餐
+
+它把“每个 token 的纯计算”换成了新的难题：
+
+- router 可能把大量 token 都送到少数热门专家；
+- 专家分布在不同 GPU，token 需要 all-to-all 通信；
+- 每张卡收到的 token 数不同，最慢的卡决定整步速度；
+- 2.8T 权重即使稀疏激活，也要被保存、加载、检查点化和部署；
+- 某些专家可能长期收不到 token，成为“死亡专家”。
+
+所以报告中很大篇幅在讲负载均衡、专家并行和显存管理，而不是只报一个漂亮的参数量。
+
+## 第五层基础：多模态和 Agent 分别多了什么
+
+### 多模态：先把图像变成“可被主干理解的 token”
+
+视觉编码器会把图像切成 patch，再将 patch 转成视觉向量。projector 把视觉向量映射到语言模型的 embedding 空间，主干于是可以在同一序列中处理文字和图像信息。
+
+“原生多模态”通常意味着视觉和文本在预训练阶段就联合出现，而不是先完成纯文本模型、最后再接一个视觉模块做短期对齐。这并不自动保证所有视觉任务都强，但它改变了表示学习和数据配方。
+
+### Agent：模型外面还有一个执行循环
+
+一个聊天模型只输出文本；一个 Agent 系统还要把模型放进循环：
+
+```text
+观察环境 → 规划下一步 → 调用工具 → 读取结果 → 更新计划 → 继续执行
+```
+
+工具可以是浏览器、终端、代码解释器、数据库或办公软件。长程任务的困难不只在“会不会回答”，还在：
+
+- 能否保存数小时的状态；
+- 中途失败后能否恢复；
+- 是否会被无关页面带偏；
+- 是否知道何时验证结果；
+- 几十次工具调用后是否仍然遵守目标。
+
+因此 K3 报告中的 Agent 能力不是一个单独的“Agent 层”，而是模型、训练环境、奖励、上下文管理、缓存和沙箱共同产生的系统能力。
+
+## K3 的总设计：在三个方向扩大信息流
+
+![Kimi K3 总架构：KDA、Gated MLA、Stable LatentMoE、Attention Residuals 与视觉入口](/posts/kimi-k3-architecture-from-zero/architecture.png)
+
+*图 1：Kimi K3 总架构。原图来自[官方技术报告 Figure 2](https://arxiv.org/abs/2607.24653)。读图时先看右侧主干：三个 KDA 层后接一个 Gated MLA；绿色模块是 Stable LatentMoE；红色跨层连线是 AttnRes；底部是 MoonViT-V2 视觉入口。*
+
+报告把架构组织成三个方向：
+
+| 方向 | 问题 | K3 的方法 |
+| --- | --- | --- |
+| 序列长度 | 一个 token 如何读取很远的上下文？ | KDA + 周期性 Gated MLA |
+| 网络深度 | 后面的层如何找回前面层的表示？ | Attention Residuals |
+| 通道宽度 | 如何增加模型容量而不激活全部参数？ | Stable LatentMoE |
+
+这种表述比背模块名更重要。K3 不是在经典 Transformer 上随意堆零件，而是在 token、layer、channel 三个相互垂直的轴上分别处理信息流瓶颈。
+
+## 深入一：KDA——把不断增长的历史压进可更新状态
+
+### 全注意力像“翻遍全部历史卡片”
+
+每个新 token 都保留 K/V 卡片，新的 Query 再翻查所有卡片。优点是细粒度、可直接访问任意历史位置；缺点是历史越长，卡片越多。
+
+### 递归状态像“一本持续更新的工作笔记”
+
+线性注意力或状态空间模型尝试维护一个固定大小的状态 $S_t$。读到新 token 后更新状态，以后不必保留每张原始卡片：
+
+$$
+S_t=\operatorname{Update}(S_{t-1},k_t,v_t),
+\qquad
+o_t=\operatorname{Read}(S_t,q_t).
+$$
+
+这让缓存不再随 token 数逐项增长，但也带来两个代价：
+
+1. 很多历史信息被压进有限状态，精确回忆可能更难；
+2. $S_t$ 依赖 $S_{t-1}$，递归看起来不利于 GPU 并行。
+
+Kimi Delta Attention（KDA）就是对这个方向的一种具体实现。它继承了 [Kimi Linear](https://arxiv.org/abs/2510.26692) 的混合设计，并吸收 delta rule、门控衰减和 GPU chunkwise 算法。
+
+### Delta rule：写入前先纠正旧记忆
+
+先看去掉衰减后的简化式：
+
+$$
+S_t=S_{t-1}+\beta_t k_t\left(v_t-S_{t-1}^\top k_t\right)^\top.
+$$
+
+$S_{t-1}^\top k_t$ 是旧状态对当前 key 的预测，$v_t$ 是希望它记住的新 value，两者之差是预测误差。更新的意思是：
+
+> 如果工作笔记看到线索 $k_t$ 时给出了错误内容，就沿着 $k_t$ 的方向擦掉一部分旧答案，再写入更接近 $v_t$ 的内容。
+
+$\beta_t$ 控制本次修改有多强。它与机器学习中“预测—误差—更新”的基本思想一致。
+
+K3 报告中的完整递归式还加入逐通道衰减：
+
+$$
+S_t=
+\left(I-\beta_tk_tk_t^\top\right)
+\operatorname{Diag}(\alpha_t)S_{t-1}
++\beta_tk_tv_t^\top,
+$$
+
+$$
+\widetilde{o}_t=S_t^\top q_t.
+$$
+
+这里可以分三步理解：
+
+1. $\operatorname{Diag}(\alpha_t)$：不同通道以不同速度遗忘；
+2. $I-\beta_tk_tk_t^\top$：沿当前 key 方向修正旧关联；
+3. $\beta_tk_tv_t^\top$：写入新的 key–value 关联。
+
+这不是“把所有历史无损压缩”。状态容量有限，冲突 key 会相互干扰。周期性 MLA 正是用来补足这种压缩记忆的。
+
+### 递归为什么还能在 GPU 上跑快
+
+逐 token 递归天然串行。KDA 使用 **chunkwise** 形式：
+
+- chunk 内部把一小段 token 重写成矩阵运算，并行计算；
+- chunk 与 chunk 之间传递固定大小的状态。
+
+这就像把一百万条流水账分成很多批：批内并行汇总，批与批之间只交接期末余额。算法是否真正更快，仍取决于矩阵尺寸、精度、内核融合和硬件；“理论上是线性注意力”不等于朴素实现必然快。
+
+### 一个看似很小的约束，为什么能换来 Tensor Core
+
+![K3 对 KDA 衰减设置下界，使对角 tile 也能使用稠密 Tensor Core 计算](/posts/kimi-k3-architecture-from-zero/kda-bounded-decay.png)
+
+*图 2：K3 的 lower-bounded decay。左侧限制对数衰减，右侧展示由此消除特殊的 position-pair diagonal 路径。原图来自[官方技术报告 Figure 3](https://arxiv.org/abs/2607.24653)。*
+
+KDA 需要在 chunk 内做带衰减的矩阵变换。原版参数化可能产生极大的累计衰减，数值重标定后，一些对角 tile 必须走特殊而较慢的 position-pair 计算路径。
+
+K3 将对数衰减写为：
+
+$$
+g_t^h=g_{\min}\operatorname{Sigmoid}\!\left(e^{A_h}z_t^h\right),
+\qquad
+\alpha_t^h=e^{g_t^h},
+$$
+
+并设置 $g_{\min}=-5$。因此单步 retention 不会小于 $e^{-5}$。对 16-token tile，累计 log-decay 落在 $(-80,0)$，相应重标定因子小于 $e^{80}$，仍在 BF16 的动态范围内。
+
+它的工程价值不是“模型更会记忆”，而是：**数值范围受控后，对角和非对角 tile 都能转成稠密矩阵乘法，交给 Tensor Core。** 这是典型的算法—数值—硬件协同设计：改一个门控参数化，是为了让硬件走更快的路径。
+
+### full-rank gate：读出后再决定哪些通道能通过
+
+K3 先对 KDA 的多头输出做 head-wise RMSNorm，再用输入相关的全秩门控调节输出通道。直觉上，状态已经给出“记起了什么”，门再决定“当前 token 应该接收其中哪些部分”。
+
+门控并不是 K3 独有的魔法。近年来的 [Gated Attention](https://arxiv.org/abs/2505.06708) 工作也表明，合适的门可以改善注意力输出的可控性和稳定性。关键在于 K3 把它整合进长上下文架构与内核实现中。
+
+## 深入二：为什么还保留 Gated MLA
+
+如果 KDA 能用固定状态处理历史，为什么不把 93 层全部换成 KDA？因为压缩状态和精确全局检索擅长不同事情。
+
+### MLA：先压缩每个 token 的 K/V，再做全局注意力
+
+Multi-head Latent Attention（MLA）不会为每个 head 完整缓存 K/V，而是先把 token 压成低维 latent：
+
+$$
+c_t^{KV}=W^{DKV}h_t.
+$$
+
+计算注意力时再通过上投影恢复内容 key 和 value。缓存的是 $c_t^{KV}$，所以比完整多头 K/V 更省显存，但它仍保留“每个 token 有一条缓存记录”的全局注意力能力。
+
+可以用下面的对照理解：
+
+| 机制 | 历史保存方式 | 优点 | 主要代价 |
+| --- | --- | --- | --- |
+| 全 MHA | 每层、每 token 的完整 K/V | 最直接的全局访问 | KV cache 大 |
+| MLA | 每 token 的压缩 latent | 全局访问 + 更小缓存 | 缓存仍随序列增长 |
+| KDA | 固定大小递归状态 | 长度方向缓存近似固定 | 历史被压缩，递归需特殊内核 |
+
+K3 采用 3:1 的 KDA–MLA 混合：大多数层用 KDA 高效传播长程状态，周期性 Gated MLA 允许 token 对整个历史做高容量的内容交互，最后一层也是 MLA。
+
+### NoPE：位置从 KDA 的动态中来
+
+传统 Transformer 常使用 RoPE 将位置旋转进 Q/K。上下文扩展到更长时，往往要调整 RoPE base 或做插值。K3 的 MLA 层不使用显式位置编码（NoPE）：
+
+- KDA 的递归顺序、衰减和门控提供时序与新近性信息；
+- MLA 负责不受位置编码约束的全局内容匹配。
+
+这减少了扩展上下文时对位置参数的改造，但不要把它理解成“模型不需要顺序”。顺序信息并未消失，而是主要由 KDA 的状态演化隐式承载。
+
+### FP32 attention output：低精度不是越低越好
+
+报告指出，为修正 flash attention 中带偏的舍入误差，训练时保留 FP32 attention output。FP32 会占用更多片上空间，于是团队重新安排 query tile 与 KV staging buffer 的共享内存重叠。
+
+这提醒我们：现代大模型并不是全程使用一种精度。权重、激活、累加、输出和优化器状态可能各用不同格式；某一步升到 FP32，也可能通过内核重排收回吞吐损失。
+
+## 深入三：Attention Residuals——让层也能“回看历史”
+
+### 标准残差像深度方向的 RNN
+
+标准残差把所有以前层的结果累积进一个状态。第 80 层只能看到第 79 层交给它的综合结果，无法显式说“我现在更需要第 12 层保留的词法信息”。
+
+[Attention Residuals](https://arxiv.org/abs/2603.15031) 把注意力的思想从 token 轴搬到 layer 轴：每一层拥有一个可学习的 pseudo-query，对之前层或 block 的表示打分，再按需要取回。
+
+可以用一个概念式表示：
+
+$$
+r_l=\sum_{i<l}a_{l,i}\operatorname{Norm}(h_i),
+\qquad
+a_{l,i}=\operatorname{softmax}_i(\operatorname{score}(q_l,h_i)).
+$$
+
+这不是报告全部实现细节，但准确表达了核心区别：标准 residual 近似给历史层固定的累积权重，AttnRes 让当前层学习“该从哪一层取多少”。
+
+### Full AttnRes 为什么还要变成 Block AttnRes
+
+如果每层保留所有更早层的输出，深度 $L<100$ 时 $O(L^2d)$ 算术不算夸张，但需要让 $O(Ld)$ 的中间表示持续存活。在 pipeline parallelism 中，这些表示还可能跨 stage 通信。
+
+K3 将若干相邻层组成 block：
+
+- block 内把层输出累加成一个 block 表示；
+- 后续层在 embedding、已完成 block 和当前 block 的部分和之间做注意力；
+- 报告配置近似是每 12 层一个 block，最后一个 block 可以不满。
+
+于是它保留“按深度选择信息”的能力，同时减少激活内存和跨 stage 通信。这里又出现同一种设计哲学：**先提出表达能力更强的完整形式，再为真实集群重写成可承受的块状形式。**
+
+## 深入四：Stable LatentMoE——把 896 个专家放进可训练的系统
+
+K3 每层有 896 个 routed experts，每个 token 选 16 个，另有 2 个 full-width shared experts。路由稀疏度是 $896/16=56$：只看路由专家时，每个 token 约使用 $1/56$。
+
+### 为什么专家要放到 latent space
+
+如果每个专家都直接在 7,168 维完整空间工作，896 个专家的参数量和计算都非常惊人。LatentMoE 先把主干向量降到 3,584 维：
+
+$$
+z=W_{\downarrow}x,
+$$
+
+路由专家在 latent space 中处理 $z$，聚合后再升回完整隐藏维度：
+
+$$
+u=\sum_{i\in\operatorname{TopK}}p_iE_i^{\text{routed}}(z),
+$$
+
+$$
+y=\sum_{j=1}^{2}E_j^{\text{shared}}(x)
++W_{\uparrow}\operatorname{RMSNorm}(u).
+$$
+
+共享专家处理普遍能力，路由专家在更紧凑的子空间中扩展专业容量。
+
+### 稳定性问题一：连续矩阵乘法会放大激活
+
+降维、专家内部两次投影、再升维形成较长的矩阵乘法链。若每一步都让尺度略微放大，极端值可能在低精度训练中溢出。
+
+K3 在路由专家聚合后、升维前增加 RMSNorm，把尺度重新拉回稳定区间。
+
+### 稳定性问题二：SwiGLU 的两个分支都可能无界
+
+SwiGLU 的门分支和 up 分支相乘，遇到两个很大的正值时，输出可能爆炸。K3 提出 SiTU-GLU，用 smooth cap：
+
+$$
+\operatorname{softcap}(x,\beta)=\beta\tanh(x/\beta)
+$$
+
+分别限制 gate 的线性因子和 up 分支。报告设置 $\beta_1=4$、$\beta_2=25$，所以标量乘积上界为 $\beta_1\beta_2=100$。在原点附近，$\tanh(x/\beta)\approx x/\beta$，因此它尽量保留 SwiGLU 的局部行为；输入很大时则平滑饱和。
+
+这与直接 `clamp` 不同：smooth cap 没有突然的折点，梯度变化更平滑。
+
+### 稳定性问题三：896 个专家如何避免冷热不均
+
+![Quantile Balancing 将过热专家的 token 重新分配给利用不足的专家](/posts/kimi-k3-architecture-from-zero/quantile-balancing.png)
+
+*图 3：Quantile Balancing 示意。左侧 top-k 路由产生 4、3、1、0 的不均衡负载；中间按每个专家的 margin 分位数调整 bias；右侧得到 2、2、2、2。原图来自[官方技术报告 Figure 5](https://arxiv.org/abs/2607.24653)。*
+
+传统做法常给 loss 加一个“负载均衡辅助项”。但辅助 loss 可能和语言建模目标拉扯。K3 采用 auxiliary-loss-free routing：每个专家有一个只用于 top-k 选择的 bias $b_j$。
+
+Quantile Balancing（QB）的直觉是：
+
+1. 对每个 token，找出“专家 $j$ 距离进入 top-k 还差多少”的 margin；
+2. 如果目标平均负载是 $q=mk/n$，就取相应分位点作为该专家的 bias 调整；
+3. 热门专家的门槛升高，冷门专家的门槛降低；
+4. 用直方图和 all-reduce 近似全局分位数，避免收集所有 token 分数。
+
+它比“负载多了就固定减一点”更有信息：调整幅度来自当前 margin 分布，知道一个专家究竟差多远才会改变 top-k 选择。训练结束后 bias 固定，用于推理路由。
+
+## 原生视觉：MoonViT-V2 为什么从头训练
+
+许多多模态模型先训练或加载一个对比学习视觉编码器，再接到 LLM。K3 的 MoonViT-V2 从随机初始化开始，直接和文本主干一起做 next-token prediction。
+
+报告给出的动机是训练稳定性：在他们的消融中，SigLIP 初始化版本的视觉塔梯度范数更高、尖峰更多；从头训练的 MoonViT-V2 更稳定，同时在他们的视觉评测中与基线相当。
+
+MoonViT-V2 的关键信息包括：
+
+- 27 层，约 401M 参数；
+- 使用 RMSNorm，线性层和注意力投影去掉 bias；
+- 图像和视频共享参数；
+- 帧内做空间注意力，帧间做时间注意力；
+- temporal pooling 压缩视频时间 token；
+- 2×2 pixel shuffle 将视觉 token 数再缩小 4 倍；
+- 报告支持最高 3,584×3,584 的图像输入。
+
+“从头训练更稳定”是该训练设置中的实验结论，不是说预训练视觉编码器普遍无用。数据规模、优化器、学习率和主干配方改变后，结论也可能改变。
+
+## Per-Head Muon：优化器也要理解注意力结构
+
+AdamW 逐元素维护一阶和二阶矩，是大模型训练的常见选择。Muon 类优化器则对矩阵梯度的动量做正交化，希望不同方向更新更均衡。[Muon scaling 研究](https://arxiv.org/abs/2502.16982)在其受控实验中报告了相对 AdamW 更高的计算效率，但这不意味着所有模型都能自动获得同一倍率。
+
+K3 的 Per-Head Muon 不把整个 Q/K/V 投影矩阵一起正交化，而是按 attention head 分块处理。原因是：不同 head 的梯度尺度可能不同；把它们拼成大矩阵，强势 head 可能影响其他 head 的更新。按 head 处理，让优化器的几何结构和模型真实分组对齐。
+
+这也是前沿架构的一个趋势：优化器不再只是“模型之外的通用按钮”，而会感知 head、专家和并行分片等结构。
+
+## 预训练：从 8K 到 1M，不只是喂更多文本
+
+### 数据组成
+
+报告将预训练数据概括为：
+
+- Web Text；
+- Code；
+- Math；
+- Knowledge；
+- 图文说明、交错文档、OCR、视觉感知、视频；
+- SVG、3D、网页、游戏和 CAD 等 visual coding 数据。
+
+数据会经历质量分类、去重和领域重加权。知识与数学内容还会重述并验证信息忠实度。报告没有公开完整数据清单和每一类比例，因此外部读者不能仅凭这份报告完整复现训练数据。
+
+### 上下文长度课程
+
+K3 不是从第一步就用 1M 序列训练，而是逐步延长：
+
+1. 主预训练从 8K 走向 64K；
+2. cooldown 阶段继续到 256K；
+3. 最终扩展到 1M。
+
+长文档需要额外清洗：近重复、二进制垃圾、截断文件、无效机器日志都会在长序列中浪费大量计算。团队还合成需要跨远距离收集分散信息的任务，避免“窗口有 1M，但模型只使用开头和结尾”。
+
+不过，**支持 1M 输入不等于对 1M 中每个位置都有完美召回。** 上下文容量、有效利用、任务准确率和延迟是四个不同指标。
+
+### scaling law：2.5× 应该怎样读
+
+Scaling law 研究用较小规模实验拟合损失随计算量、参数和数据变化的曲线，再选择大模型配方。K3 重新搜索 batch size、学习率、每参数 token 数和模型形状，并比较 cosine 与 WSD 学习率日程。
+
+报告的 2.5× 表示：在他们拟合的分布外验证损失曲线上，达到相当损失时，K3 整体方案相对 K2 需要更少计算，或在相当计算下达到更低损失。它不能拆解成“AttnRes 贡献多少、KDA 贡献多少、数据贡献多少”，因为报告没有给出覆盖所有组件的同尺度独立消融。
+
+## 后训练：不是训练一个模型，而是先训练九位老师
+
+K3 的后训练可以压缩为三段：
+
+```text
+SFT 冷启动
+  ↓
+3 个领域 × 3 个 reasoning effort = 9 个 RL 专家
+  ↓
+Multi-Teacher On-Policy Distillation
+  ↓
+统一的 Kimi K3
+```
+
+### 第一步：SFT 建立可用行为
+
+监督微调（SFT）使用经过验证或人工标注的轨迹，让模型掌握指令遵循、工具调用格式和长任务的基本执行方式。K3 从 SFT 阶段就加入量化感知训练，为后面的低精度部署做准备。
+
+### 第二步：九个 RL 专家
+
+团队把任务分为三个领域：
+
+1. **general tasks**：知识、推理、视觉、搜索、忠实性和专业工作；
+2. **general agents**：长程助手、深度研究、长文写作；
+3. **coding agents**：软件工程、代码、GPU kernel 和网页开发。
+
+每个领域再训练 low、high、max 三种 reasoning effort，共九个专家模型。这里的“专家”是九个完整策略教师，不是前面 MoE 层中的 896 个前馈专家；两者不要混淆。
+
+### Reasoning effort：给思考设置预算，而不是越长越好
+
+每道题先有一个冷启动预算 $b_0(x)$，再乘预算系数 $\tau$。超过预算的轨迹会受到惩罚。训练先得到较大的 max 预算，再逐步减小 $\tau$ 获得 high 和 low。
+
+这解决两个问题：
+
+- 简单问题没必要花几万 token；
+- 只奖励正确率，模型可能通过无休止思考或冗长工具调用“堆概率”。
+
+对 Agent 任务，预算不仅计算思考 token，还包括工具调用参数等全部输出成本。
+
+### Partial rollout：不等最慢的轨迹
+
+长程 Agent 轨迹的耗时差异很大。有的五分钟结束，有的可能卡在网页、编译或沙箱中数小时。如果同步 RL 必须等最后一条，GPU 会大量空闲。
+
+K3 对 $N$ 个 prompt 各采样 $K$ 条轨迹；当完成比例达到 $\lambda$ 时就开始当前轮优化，未完成轨迹暂停并排队，下一轮恢复。它类似考试时先批完已交卷的试卷，而不是等所有人。
+
+代价是恢复后的轨迹可能来自较旧策略，形成 off-policy/stale data。报告用逐 token 正则约束策略更新，避免新旧策略相差过远。
+
+### Agentic GRM：奖励模型也要先写评分表
+
+不是所有任务都有单元测试。对写作、研究或办公产物，K3 的 generative reward model 被要求：
+
+1. 读取产物；
+2. 生成 rubric；
+3. 按 rubric 给候选评分；
+4. 把分项分数记入 scorepad。
+
+此外还有 verbosity budget，避免“写得更长”成为奖励黑客手段。它没有消除奖励模型偏见，但让判断过程更结构化、更容易审计。
+
+### MOPD：让学生亲自走路，再由对应老师逐 token 指导
+
+![K3 在多个能力域中随 RL 计算增加的分数与平均步骤趋势](/posts/kimi-k3-architecture-from-zero/rl-scaling.png)
+
+*图 4：报告展示 RL FLOPs 扩展时，多类能力分数和平均 Agent 步数的变化。它说明团队观察到总体上升趋势，但曲线并非每一点都单调。原图来自[官方技术报告 Figure 8](https://arxiv.org/abs/2607.24653)。*
+
+Multi-Teacher On-Policy Distillation（MOPD）用于把九个教师合并回统一模型。
+
+- **multi-teacher**：不同领域、不同预算由对应教师指导；
+- **on-policy**：回答前缀由当前学生模型自己生成，不只模仿教师离线数据；
+- **dense per-token reward**：每个 token 都比较教师和学生对实际生成 token 的相对偏好，并裁剪极端信号。
+
+为什么 on-policy 重要？如果学生只看老师的完美轨迹，实际部署时一旦自己走错一步，就可能进入从未训练过的状态。让学生先产生当前会遇到的前缀，再由教师纠偏，更接近真实推理分布。
+
+这条路线与 [on-policy distillation](https://arxiv.org/abs/2306.08543) 的基本动机一致，但 K3 把多领域、推理预算和长程 partial rollout 整合到同一个训练系统中。
+
+### 量化感知与推测解码：部署约束提前进入训练
+
+MoE 专家权重占据大部分模型参数。K3 将 routed expert 权重量化到 MXFP4，相关激活使用 MXFP8；注意力投影、latent projection、共享专家和 router 保持更高精度。SFT 与 RL 都使用相同量化方案，减少“训练时高精度、部署时突然量化”的落差。
+
+生成端还把预训练的 multi-token prediction 层微调为 EAGLE-3 风格 draft model，一次提出多个候选 token，再由大模型验证。draft 训练直接优化接受率相关的 LK loss，而不只最小化 KL divergence。
+
+重要边界是：推测解码在分布保持正确的前提下减少大模型调用次数，它不会把草稿模型的错误直接当成最终输出。
+
+## Agent 训练环境：模型能力取决于它练过什么循环
+
+![K3 使用知识图谱检索材料并合成跨领域任务](/posts/kimi-k3-architecture-from-zero/task-synthesis.png)
+
+*图 5：知识图谱引导的任务合成。先在跨领域图谱中采样关键词，再检索真实材料，最后选择 coding、knowledge、vision 等任务模板。原图来自[官方技术报告 Figure 9](https://arxiv.org/abs/2607.24653)。*
+
+K3 使用统一的 white-box Agent 环境，将工具、系统提示、上下文管理、skills、memory 和 subagents 组合起来，并刻意变化 Agent harness，降低模型只适应一种脚手架的风险。
+
+任务来源包括：
+
+- 可验证搜索和专业知识工作；
+- 软件工程、GPU kernel 优化；
+- 视觉推理与视觉内容生成；
+- 模拟 Gmail、Notion、Slack、Canvas 的个人助理任务；
+- 带黑盒系统和 verifier 的 Autonomous Execution Tasks；
+- 网页开发与交互式产物。
+
+知识图谱的价值在于控制覆盖面：纯随机抓网页容易反复采到热门主题，图谱可以主动寻找稀疏领域，再用公开材料构造有来源、可验证的任务。
+
+但合成任务依然有分布偏差。如果 verifier 容易被钻空子，RL 会放大漏洞；如果环境过于整洁，模型在真实网站的广告、登录、弹窗和超时面前仍可能失效。
+
+## 基础设施：为什么一份“模型报告”有三分之一在讲系统
+
+到这里，算法已经提出了新的状态、专家、跨层表示和长程轨迹。下一步的问题不再是“公式是否优雅”，而是“几百或几千张 GPU 能否持续工作”。
+
+### KDA Context Parallelism：并行扫描状态
+
+普通 context parallelism 可以把长序列切到多张 GPU，但 KDA 的后半段状态依赖前半段。K3 将一个序列片段表示为：
+
+- 该片段对输入状态施加的 transition；
+- 从零状态开始时该片段产生的 state。
+
+这两个量可以用结合律合成，于是通过 prefix scan 计算每张卡的正确初始状态。通信的是固定大小状态摘要，而不是全部 token。它与并行前缀和的思想相同：先局部计算，再树状合并前缀结果。
+
+### MoonEP：数学上均衡不等于机器上均衡
+
+![K3 预训练中前向、反向、通信与 offload 的重叠调度](/posts/kimi-k3-architecture-from-zero/moon-ep-overlap.png)
+
+*图 6：不同 pipeline phase 中计算、expert-parallel 通信和 offload 的重叠。原图来自[官方技术报告 Figure 11](https://arxiv.org/abs/2607.24653)。*
+
+即使 Quantile Balancing 让 896 个专家的全局 token 数接近，某一时刻分到每个 expert-parallel rank 的 token 仍可能不均。MoonEP 动态创建冗余专家副本，让每个 rank 承担相同数量的专家计算，并用 GPU 在线规划、zero-copy dispatch 和静态 shape 减少 host 同步。
+
+这说明负载均衡有两层：
+
+1. **模型层**：router 不要让专家学习失衡；
+2. **系统层**：每张 GPU 的实际工作量和通信时间要均衡。
+
+### 激活、梯度和参数不能都留在 GPU
+
+K3 的统一内存策略会为不同激活选择：重计算、FP8 保存、本地 offload 或远端 pipeline rank offload；梯度分片还可卸载到 CPU。Block AttnRes 也需要专门 checkpoint，因为历史 block 表示要跨层保留。
+
+这些方法本质上都在交换三类资源：
+
+$$
+\text{显存容量}\quad\leftrightarrow\quad
+\text{额外计算}\quad\leftrightarrow\quad
+\text{通信带宽}.
+$$
+
+没有一种策略在所有集群上最优，必须看 GPU 内存、互联拓扑、CPU 内存和流水线空泡。
+
+### RL 系统必须暂停、恢复甚至复制“世界”
+
+长程 Agent 的状态不仅是模型 KV cache，还包括浏览器、文件系统、进程和网络服务。K3 报告使用 Firecracker microVM：
+
+- 可以 pause/resume；
+- 可以 fork 和 snapshot；
+- 增量 checkpoint 报告为 133 ms，恢复为 49 ms；
+- 通过内存超分提高主机利用率；
+- 训练状态在阶段间可卸载到 NVMe。
+
+这些是报告所述系统中的测量值，不应外推到所有硬件和任务。它们的意义是说明 partial rollout 不是只改一行 RL 代码：必须能把外部执行环境连同轨迹一起可靠冻结。
+
+### 服务端：一百万 token 还要面对缓存碎片
+
+![KDA checkpoint 与 MLA KV cache 对齐后的细粒度前缀复用](/posts/kimi-k3-architecture-from-zero/prefix-cache.png)
+
+*图 7：K3 将 6,144-token 物理 cache block 分成 512-token hash block，并在边界保存稀疏 KDA checkpoint。命中点 $B=2560$ 时，服务端恢复 KDA 状态并复用此前 MLA KV。原图来自[官方技术报告 Figure 12](https://arxiv.org/abs/2607.24653)。*
+
+MLA 缓存按 token 增长，KDA 状态却是一段历史的累计结果。只在很大的物理 block 边界存 KDA 状态，会让短公共前缀几乎无法复用；每 512 token 都存完整状态，又会浪费空间。
+
+K3 采用稀疏 KDA checkpoint + 细粒度 MLA hash block：找到两种缓存都命中的最长边界，从那里恢复状态并继续 prefill。
+
+服务调度还要区分不同请求类别。小于 2K 和接近 1M 的请求，成本可相差约三个数量级；若用同一队列，少量超长任务就可能拖垮普通聊天延迟。
+
+## 如何阅读 K3 的评测，而不被排行榜带着走
+
+报告覆盖 reasoning、coding、agentic 和 vision。几个有代表性的自报结果包括：
+
+| 评测 | K3 报告值 | 应怎样理解 |
+| --- | ---: | --- |
+| GPQA Diamond | 93.5 | 研究生级科学问答表现强 |
+| BrowseComp | 91.2 | 依赖搜索 Agent、工具和评测设置 |
+| Terminal-Bench 2.1 | 88.3 | 终端执行能力强，harness 影响很大 |
+| CharXiv RQ with tool | 91.3 | 视觉图表 + 工具条件下的结果 |
+| OSWorld Verified | 84.8 | 报告中的特定版本与环境 |
+
+报告本身也承认：K3 在其评测套件中总体落后于最强的闭源模型，但领先于其余被比较模型；在 research-level reasoning 等任务上仍有明显差距。
+
+看任何大模型榜单时，至少检查：
+
+1. **日期**：模型和榜单每周都可能更新；
+2. **推理预算**：low、high、max 可能不是同一成本；
+3. **工具**：with tool 和纯模型不是一项能力；
+4. **Agent harness**：搜索、重试、上下文压缩和失败回退都会改变结果；
+5. **pass@k**：尝试多次的成功率不能和一次成功率直接比较；
+6. **自报/第三方**：官方复现环境可能比公共环境更贴合；
+7. **成本与延迟**：最高分可能来自更长推理和更多工具调用。
+
+报告中的第三方排行标注了 2026 年 7 月 23 日等具体日期，所以只能看作**报告发布时的快照**，不能当作今天永恒有效的名次。
+
+### Case study 是能力展示，不是受控实验
+
+报告展示了 24 小时 GPU kernel 优化、MiniTriton 编译器、芯片原型、计算天体物理和专业知识工作等案例。它们很有价值：证明模型能够在真实工具链中维持长任务，并产出可运行 artifact。
+
+但案例通常没有随机对照、重复试验和失败分布。它回答“模型能否在这个精心记录的任务中做到”，不完全回答“随机抽取一百个类似任务，成功率是多少”。
+
+## 安全：Agent 越会执行，错误和滥用也越能执行
+
+K3 报告专门评估网络安全能力。报告称，在人工审查的候选漏洞中约 70% 被确认，并发现 6 个项目中的 16 个此前未知漏洞；在 exploit suite 上完成 14/36。独立评估中，某些利用基准高于对照模型，但 41 个任意代码执行任务为 0/41。
+
+这些数字同时表达两件事：
+
+- 模型已经能协助真实漏洞发现，具有防御价值；
+- 能力并不稳定，离自主完成复杂利用仍有距离，但风险不能忽略。
+
+当模型拥有终端、网络、持久记忆和数小时预算后，安全边界不应只放在“回答前过滤一句话”。最小权限、网络隔离、凭证管理、动作审批、审计日志和可恢复沙箱都成为模型系统的一部分。
+
+## K3 反映了哪些前沿趋势
+
+截至 2026 年 8 月，K3 最值得关注的不是某个榜单名次，而是它把多条研究线整合到同一个生产级模型中。
+
+### 1. 全注意力正在变成混合记忆系统
+
+全注意力的精确检索能力仍然重要，但百万 token 的 KV cache 太昂贵。K3 用 KDA + MLA；其他路线也在探索 [Gated DeltaNet](https://arxiv.org/abs/2412.06464)、状态空间模型、局部/全局混合和稀疏注意力。
+
+前沿问题已不是“attention 会不会彻底消失”，而是：哪些层保留全局检索，哪些层使用压缩状态，二者怎样共同训练和缓存。
+
+### 2. 稀疏扩展从“更多专家”走向“专家—路由—系统共同设计”
+
+[DeepSeek-V3](https://arxiv.org/abs/2412.19437) 等模型推动了 auxiliary-loss-free routing、共享专家和专家并行。K3 进一步组合 latent expert space、SiTU-GLU、Quantile Balancing 和 MoonEP。
+
+未来竞争点不只是谁的总参数更大，而是谁能让专家真正分工、稳定训练，并在集群上保持均衡。
+
+### 3. 深度本身也成为可路由的信息轴
+
+过去注意力主要在 token 之间选择，MoE 在专家之间选择。AttnRes 让模型在历史层之间选择。token、layer、expert 三个维度都在出现数据依赖路由，这可能比单纯继续增加层数更有效。
+
+### 4. 原生多模态从“对齐模块”变成数据和目标的共同设计
+
+视觉不再只作为聊天模型的外挂。图像、视频、渲染结果和生成它们的代码可以处于同一轨迹中，模型写代码、看截图、再修改。视觉能力因此和 Agent 闭环结合，而不只是图片问答。
+
+### 5. 后训练从单一奖励走向“能力组合”
+
+九个 RL 教师 + MOPD 体现了一个趋势：先在不同领域和预算上专门化，再把能力蒸馏进统一策略。难点从“训练一个得分最高的模型”变成“合并能力时不互相遗忘，并让 low/high/max 真正可控”。
+
+### 6. Test-time scaling 正在从思考 token 扩展到环境交互
+
+过去的 test-time compute 常指多写推理步骤。Agent 时代还包括搜索次数、终端命令、并行子任务、环境快照和验证。计算预算从一个 token 上限，变成对整个工作流的资源调度。
+
+### 7. 模型、内核和集群边界越来越模糊
+
+lower-bounded KDA 是为了 Tensor Core；Block AttnRes 是为了激活和 pipeline 通信；QAT 从 SFT 开始；prefix cache 同时理解 MLA 和 KDA。架构如果不能被内核高效实现，就很难在万亿参数和百万上下文下成立。
+
+## 报告没有完全回答什么
+
+理解技术报告也包括识别信息缺口。K3 报告非常详细，但仍无法回答以下问题：
+
+1. **完整训练成本**：没有披露总 token、总 FLOPs、集群规模、能耗和完整失败成本；
+2. **完整数据配方**：没有公开全部数据来源、比例和清洗细节；
+3. **单组件归因**：2.5× 是联合配方结果，无法从公开消融精确拆给 KDA、AttnRes、MoE 或数据；
+4. **外部可复现性**：许多内核、Agent 环境和系统组件未以可直接复现的形式完整开放；
+5. **百万上下文可靠性曲线**：窗口上限不等于所有位置、所有任务都能稳定利用；
+6. **真实 Agent 失败分布**：案例丰富，但大规模、相同成本、第三方受控的长程成功率仍需更多评测；
+7. **安全覆盖**：网络安全章节很重要，但不足以覆盖欺诈、隐私、越权操作、供应链和多 Agent 风险；
+8. **开放程度**：K3 是 open-weight，使用自定义 [Kimi K3 License](https://github.com/MoonshotAI/Kimi-K3/blob/main/LICENSE)。这不自动等同于 OSI 意义的开源；某些大规模商业使用还有额外条件。
+
+这些缺口不等于报告不可信，而是界定“我们现在能知道多少”。官方技术报告能证明设计者报告了什么；独立复现才能进一步证明这些结论在其他环境中是否成立。
+
+## 把整份架构再串一次
+
+现在从一个 token 的旅程复盘：
+
+1. 文本经 160K 词表变成 token；图片/视频先过 401M MoonViT-V2，再投影进同一 embedding 空间。
+2. token 进入 93 层主干。大约每三个 KDA 层后有一个 Gated MLA，总计 69 KDA + 24 MLA。
+3. KDA 用带衰减的 delta-rule 状态传播长程信息；MLA 周期性做压缩 KV 的全局内容检索。
+4. 每个注意力模块之后，Stable LatentMoE 将向量降到 3,584 维，从 896 个 routed experts 中选 16 个，再加 2 个共享专家。
+5. RMSNorm、SiTU-GLU 和 Quantile Balancing 防止激活爆炸、低精度溢出与专家失衡。
+6. Block Attention Residuals 允许深层按需读取 embedding 和早期 block，而不只依赖逐层累加。
+7. Per-Head Muon 按 attention head 组织优化器更新。
+8. 预训练逐步从 8K/64K 延长到 256K/1M，并从一开始联合文本和视觉。
+9. SFT 后分别训练 3 个领域 × 3 个预算的九个 RL 教师，再通过 MOPD 合并为统一模型。
+10. KDA kernel、MoonEP、激活 offload、microVM、外部 KV pool 和混合 prefix cache 让训练与服务在真实硬件上成立。
+
+如果这十步现在能在脑中连起来，你已经理解了技术报告的主干。
+
+## 术语速查
+
+| 术语 | 一句话解释 |
+| --- | --- |
+| token | 模型处理的离散文本单元 |
+| embedding | token 或视觉 patch 的连续向量表示 |
+| parameter | 训练中学习、推理时固定的权重 |
+| context window | 一次推理可接收的最大 token 范围 |
+| attention | 按内容相关性从其他 token 取信息 |
+| head | 一组独立的 Q/K/V 子空间 |
+| KV cache | 保存历史 token 的 Key/Value，避免 decode 重算 |
+| KDA | 用衰减、delta rule 和门控更新固定状态的线性注意力 |
+| MLA | 缓存低维 latent，再恢复 K/V 做全局注意力 |
+| NoPE | Q/K 不加入显式位置编码 |
+| residual | 将模块输入直接加回输出的信息通道 |
+| AttnRes | 用注意力选择历史层或 block 的 residual 来源 |
+| FFN/MLP | 每个 token 独立进行的通道变换 |
+| MoE | 每个 token 只激活少量专家的稀疏 FFN |
+| router | 为 token 选择 top-k 专家的模块 |
+| shared expert | 每个 token 都会使用的公共专家 |
+| RMSNorm | 按均方根归一化向量尺度 |
+| SiTU-GLU | 用 tanh softcap 限制两分支幅度的 GLU |
+| Quantile Balancing | 按 margin 分位数调整专家路由 bias |
+| Muon | 对矩阵动量做正交化的优化器家族 |
+| SFT | 用示范轨迹进行监督微调 |
+| RL | 用奖励信号改善策略行为 |
+| GRM | 生成 rubric 并判断产物质量的奖励模型 |
+| MOPD | 多教师、学生在自身分布上生成的逐 token 蒸馏 |
+| QAT | 训练时模拟量化误差，让模型适应部署精度 |
+| prefill | 并行处理输入前缀 |
+| decode | 自回归地逐 token 生成 |
+| context parallelism | 将长序列切到多张设备协作处理 |
+| speculative decoding | 小草稿模型提案，大模型批量验证 |
+
+## 十个自测问题
+
+不看上文，试着回答：
+
+1. 为什么 2.8T 总参数与 104.2B 激活参数都是真的？
+2. 全注意力和 KDA 分别如何保存历史？
+3. KDA 已经存在时，为什么还要周期性插入 MLA？
+4. K3 使用 NoPE，顺序信息从哪里来？
+5. lower-bounded decay 为什么首先是一项硬件效率设计？
+6. AttnRes 与普通 residual 的核心区别是什么？
+7. Stable LatentMoE 的 RMSNorm、SiTU-GLU 和 QB 各处理哪类不稳定？
+8. 九个 RL 专家和 896 个 MoE 专家为什么不是一回事？
+9. partial rollout 为什么需要可暂停、恢复的沙箱？
+10. 为什么“1M context”“benchmark 高分”和“真实长任务可靠”是三个不同结论？
+
+如果你能用自己的话回答八个以上，就已经不再是“完全不懂架构”的读者了。下一步最有效的学习方式不是继续背缩写，而是任选一个方向深入：
+
+- 想理解模型数学：实现一次小型 attention、KV cache 和 delta-rule state；
+- 想理解训练：学习 loss、backprop、AdamW/Muon、SFT 和 policy gradient；
+- 想理解系统：从[《CS336 第二讲：显存与资源核算》](/posts/cs336-lecture-02-pytorch-resource-accounting)开始，再看并行、通信和 kernel；
+- 想理解 Agent：亲手构建一个“模型—工具—验证器”循环，记录每次失败来自模型还是环境。
+
+## 延伸阅读与来源
+
+- [Kimi K3 Technical Report](https://arxiv.org/abs/2607.24653)：本文架构数字、公式、训练与系统事实的主要来源。
+- [MoonshotAI/Kimi-K3](https://github.com/MoonshotAI/Kimi-K3)：官方模型仓库、配置和许可证。
+- [Hugging Face 模型页](https://huggingface.co/moonshotai/Kimi-K3)：模型文件与使用说明。
+- [Attention Is All You Need](https://arxiv.org/abs/1706.03762)：Transformer 基础。
+- [Kimi Linear](https://arxiv.org/abs/2510.26692)：KDA 与 MLA 混合架构的直接前身。
+- [Gated Delta Networks](https://arxiv.org/abs/2412.06464)：delta-rule 线性注意力的重要背景。
+- [Gated Attention for Large Language Models](https://arxiv.org/abs/2505.06708)：注意力输出门控的背景。
+- [Attention Residuals](https://arxiv.org/abs/2603.15031)：深度方向信息检索。
+- [LatentMoE](https://arxiv.org/abs/2601.18089)：在低维 latent space 扩展专家容量。
+- [Muon is Scalable for LLM Training](https://arxiv.org/abs/2502.16982)：Muon 在大模型上的扩展研究。
+- [DeepSeek-V3 Technical Report](https://arxiv.org/abs/2412.19437)：MoE、无辅助损失负载均衡与系统设计背景。
+- [Kimi K2.5 Technical Report](https://arxiv.org/abs/2602.02276)：K3 后训练、Agent 和多模态路线的前身。
+- [中文解读视频](https://www.bilibili.com/video/BV1KZ8X6uEPL)：适合在理解上述主线后回看，用于建立模块之间的口头叙事。
+
+最后保留一条阅读原则：**论文中的每个缩写都应当能被翻译成“它保存了什么、计算了什么、省下了什么、又牺牲了什么”。** 当你能持续问这四个问题，再复杂的架构图也会从名词迷宫变成一组可检查的工程选择。
