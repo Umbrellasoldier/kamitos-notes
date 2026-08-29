@@ -1,0 +1,1436 @@
+---
+title: "CS336 Transformer 从零实现：从张量形状到完整语言模型"
+description: "从 next-token prediction 开始，逐步实现 Linear、Embedding、RMSNorm、SwiGLU、RoPE、稳定 softmax、因果多头注意力、pre-norm block 与 TransformerLM，并解释每个形状、公式、不变量和调试陷阱。"
+publishedAt: "2026-08-29"
+category: "技术"
+tags:
+  - "CS336"
+  - "Transformer"
+  - "PyTorch"
+  - "深度学习"
+  - "大语言模型"
+featured: false
+draft: false
+---
+
+这是一篇独立的 Transformer 实现笔记，对应我在 Stanford CS336 Assignment 1 中从 `Linear` 一直写到 `TransformerLM` 的过程。它不假设读者已经会 Transformer，也不把关键步骤缩成一句“做多头注意力即可”。每个组件都会依次回答四个问题：**它在解决什么问题、公式是什么、张量形状如何变化、代码为什么这样写。**
+
+本文中的代码就是当前实现的完整核心路径。把各节代码按顺序放进同一个 `model.py`，就得到一份不依赖 `torch.nn.Linear`、`torch.nn.Embedding`、`torch.softmax` 或 PyTorch 内置 attention 的 Transformer 前向实现。最终定向测试结果是：
+
+```text
+tests/test_model.py: 13 passed in 0.19s
+```
+
+如果还没有 token IDs，可以先读[《CS336 train_bpe 实战：从正确实现到 3.5 倍性能优化》](/posts/cs336-train-bpe-performance)；如果对 dtype、显存和矩阵乘法 FLOPs 不熟悉，可以先读[《CS336 第二讲笔记：PyTorch、显存与计算资源核算》](/posts/cs336-lecture-02-pytorch-resource-accounting)。
+
+## 0. Transformer 到底要完成什么任务
+
+语言模型的训练目标是 **next-token prediction**：看到前面的 token，预测下一个 token。
+
+假设一句话被 tokenizer 编成：
+
+```text
+[12, 81, 6, 29, 4]
+```
+
+可以构造：
+
+```text
+输入 x: [12, 81, 6, 29]
+目标 y: [81,  6, 29, 4]
+```
+
+模型在每个位置都输出词表中每个 token 的分数。若：
+
+- batch size 为 $B$；
+- sequence length 为 $T$；
+- vocabulary size 为 $V$；
+
+那么输入和输出形状是：
+
+```text
+token IDs: [B, T]
+logits:    [B, T, V]
+```
+
+`logits[b, t, v]` 表示第 `b` 个样本在位置 `t` 预测 token `v` 的未归一化分数。最后一维还没有做 softmax，这一点很重要：训练时 cross entropy 可以直接接收 logits，并在内部用数值更稳定的方式完成 `log_softmax`。
+
+完整的数据流是：
+
+```text
+token IDs [B, T]
+  -> Embedding
+hidden states [B, T, D]
+  -> N 个 TransformerBlock
+hidden states [B, T, D]
+  -> RMSNorm
+normalized states [B, T, D]
+  -> Linear LM head
+logits [B, T, V]
+```
+
+Transformer 的大部分子层都保持最后一维为 $D$，就是为了能使用 residual connection：
+
+$$
+x + f(x).
+$$
+
+如果 $f(x)$ 的形状和 $x$ 不同，两者就无法逐元素相加。
+
+## 1. 先建立统一的形状语言
+
+后文反复使用下面的符号：
+
+| 符号 | 含义 |
+| --- | --- |
+| $B$ | batch size，一次处理多少条序列 |
+| $T$ | sequence length，一条序列有多少个 token |
+| $V$ | vocabulary size，词表大小 |
+| $D$ | `d_model`，每个 token 的隐藏维度 |
+| $H$ | `num_heads`，注意力头数 |
+| $d_h$ | `d_head = D / H`，每个头的维度 |
+| $F$ | `d_ff`，SwiGLU 中间维度 |
+| $N$ | Transformer block 数量 |
+
+例如：
+
+```text
+B = 2, T = 4, V = 1000, D = 24, H = 3, F = 64
+```
+
+则：
+
+```text
+token IDs                  [2, 4]
+token embeddings           [2, 4, 24]
+Q/K/V before split         [2, 4, 24]
+Q/K/V after split          [2, 3, 4, 8]
+attention scores           [2, 3, 4, 4]
+per-head attention output  [2, 3, 4, 8]
+joined attention output    [2, 4, 24]
+SwiGLU hidden              [2, 4, 64]
+block output               [2, 4, 24]
+LM logits                  [2, 4, 1000]
+```
+
+每写一行张量代码，都应当能说出最后两维的语义。很多 bug 并不会触发 shape error：维度碰巧相等时，错误的转置或广播也能运行，因此“能跑”不等于“轴的语义正确”。
+
+核心文件只需要四个导入：
+
+```python
+import math
+
+import torch
+from einops import rearrange
+from torch import nn
+```
+
+## 2. Linear：所有投影的共同积木
+
+### 2.1 数学定义和权重形状
+
+无 bias 的线性层定义为：
+
+$$
+y = xW^\top.
+$$
+
+若输入最后一维为 $D_{in}$，输出最后一维为 $D_{out}$，则：
+
+```text
+x       [..., D_in]
+weight  [D_out, D_in]
+y       [..., D_out]
+```
+
+为什么代码使用 `weight.T`？因为 PyTorch 风格的权重按 `[out_features, in_features]` 存储，而 `x` 的最后一维是 `in_features`。矩阵乘法真正需要的是：
+
+```text
+[..., D_in] @ [D_in, D_out]
+```
+
+因此要乘 `weight.T`。
+
+### 2.2 为什么初始化方差是 $2/(D_{in}+D_{out})$
+
+假设输入各分量独立、均值为 0、方差为 $q$，权重也独立且均值为 0。一个输出分量是：
+
+$$
+y_j=\sum_{i=1}^{D_{in}}x_iW_{ji}.
+$$
+
+忽略相关项后：
+
+$$
+\operatorname{Var}(y_j)
+\approx D_{in}\operatorname{Var}(x_i)\operatorname{Var}(W_{ji}).
+$$
+
+只保护前向传播时，可以令权重方差约为 $1/D_{in}$，使输出方差不随输入维度增长。可是反向传播会乘同一权重矩阵，若只照顾输入侧，输入和输出维度差异很大时，梯度尺度可能不稳定。
+
+Xavier 初始化在两者之间取折中：
+
+$$
+\operatorname{Var}(W)=\frac{2}{D_{in}+D_{out}},
+\qquad
+\sigma=\sqrt{\frac{2}{D_{in}+D_{out}}}.
+$$
+
+这里所谓“保护前向和反向”，不是阻止数值变化，而是让信号和梯度在层间传播时不至于因为维度累加而系统性爆炸或消失。
+
+### 2.3 完整实现
+
+```python
+class Linear(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+
+        self.weight = nn.Parameter(
+            torch.empty(
+                (out_features, in_features),
+                device=device,
+                dtype=dtype,
+            )
+        )
+
+        variance = 2 / (in_features + out_features)
+        std = math.sqrt(variance)
+
+        nn.init.trunc_normal_(
+            self.weight,
+            mean=0.0,
+            std=std,
+            a=-3 * std,
+            b=3 * std,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x @ self.weight.T
+```
+
+`nn.Parameter` 的含义是：这个 tensor 是模型要训练的状态，应当出现在 `state_dict()` 和 `parameters()` 中。`Linear` 类本身已经是一个 `nn.Module`，不能写成：
+
+```python
+self.w1 = nn.Parameter(Linear(...))
+```
+
+`nn.Parameter` 需要 tensor，内部会调用类似 `detach()` 的 tensor 接口；把整个 module 传进去会得到：
+
+```text
+AttributeError: 'Linear' object has no attribute 'detach'
+```
+
+正确做法是直接注册子模块：
+
+```python
+self.w1 = Linear(...)
+```
+
+它内部的 `weight` 自然会被递归注册。
+
+## 3. Embedding：从整数 ID 查到向量
+
+### 3.1 为什么不需要 one-hot
+
+词表大小为 $V$、模型维度为 $D$ 时，embedding table 的形状为：
+
+```text
+weight: [V, D]
+```
+
+token ID `i` 对应第 `i` 行。输入 `[B,T]` 直接作为行索引，输出就会多出一个长度为 $D$ 的轴：
+
+```text
+[B, T] -> [B, T, D]
+```
+
+这等价于 one-hot 向量乘 embedding matrix，但无需真的创建 `[B,T,V]` 的巨大稀疏张量。
+
+### 3.2 完整实现
+
+```python
+class Embedding(nn.Module):
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+
+        self.weight = nn.Parameter(
+            torch.empty(
+                (num_embeddings, embedding_dim),
+                device=device,
+                dtype=dtype,
+            )
+        )
+
+        nn.init.trunc_normal_(
+            self.weight,
+            mean=0.0,
+            std=1.0,
+            a=-3.0,
+            b=3.0,
+        )
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        return self.weight[token_ids]
+```
+
+一个最小形状检查：
+
+```python
+embedding = Embedding(num_embeddings=1000, embedding_dim=8)
+token_ids = torch.tensor([[2, 4, 8], [1, 0, 7]])
+output = embedding(token_ids)
+
+assert output.shape == (2, 3, 8)
+assert torch.equal(output[0, 0], embedding.weight[2])
+```
+
+## 4. RMSNorm：只控制均方根尺度
+
+### 4.1 公式
+
+对最后一维长度为 $D$ 的向量 $x$，RMSNorm 计算：
+
+$$
+\operatorname{RMS}(x)
+=\sqrt{\frac{1}{D}\sum_{i=1}^{D}x_i^2+\epsilon},
+$$
+
+然后：
+
+$$
+\operatorname{RMSNorm}(x)
+=\frac{x}{\operatorname{RMS}(x)}\odot g,
+$$
+
+其中 $g\in\mathbb{R}^{D}$ 是可学习的逐维增益。
+
+这里是 `mean(x²)`，不是方差。方差为：
+
+$$
+\operatorname{Var}(x)
+=\frac{1}{D}\sum_i(x_i-\bar{x})^2
+=\operatorname{E}[x^2]-\operatorname{E}[x]^2.
+$$
+
+RMSNorm 不减均值，因此它控制的是向量整体能量，而不是同时把均值移到 0。这也是它与 LayerNorm 的主要区别。
+
+### 4.2 为什么先转 float32
+
+平方、求和、开根号对低精度更敏感。即便模型输入是 BF16，也可以临时用 FP32 计算归一化统计，再转回输入 dtype。这样保留稳定性，同时保持模块接口的 dtype 不变。
+
+### 4.3 完整实现
+
+```python
+class RMSNorm(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        eps: float = 1e-5,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+
+        self.eps = eps
+        self.weight = nn.Parameter(
+            torch.ones(
+                d_model,
+                device=device,
+                dtype=dtype,
+            )
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_dtype = x.dtype
+        x_float = x.to(torch.float32)
+
+        rms = torch.sqrt(
+            x_float.pow(2).mean(dim=-1, keepdim=True)
+            + self.eps
+        )
+
+        output = x_float / rms * self.weight
+        return output.to(input_dtype)
+```
+
+`dim=-1` 表示无论前面是 `[B,T]` 还是更多 batch 轴，都只归一化隐藏维度。`keepdim=True` 保留一个长度为 1 的轴，使 `[... ,D] / [...,1]` 能按预期广播。
+
+## 5. SiLU 和 SwiGLU：每个 token 独立进行非线性计算
+
+### 5.1 SiLU
+
+SiLU 定义为：
+
+$$
+\operatorname{SiLU}(x)=x\sigma(x),
+\qquad
+\sigma(x)=\frac{1}{1+e^{-x}}.
+$$
+
+直接手写 `1 / (1 + exp(-x))` 在很大的负数处会计算 `exp(100)`，可能溢出。`torch.sigmoid` 使用稳定实现：
+
+```python
+def silu(x: torch.Tensor) -> torch.Tensor:
+    return x * torch.sigmoid(x)
+```
+
+一个早期版本能通过普通正数测试，却在 `x=-100` 的反向传播中产生 `NaN`。这说明只比较常规输入的前向值不够；激活函数还应测试极端值和梯度是否有限。
+
+### 5.2 SwiGLU 的三条投影
+
+SwiGLU 定义为：
+
+$$
+\operatorname{SwiGLU}(x)
+=W_2\left(\operatorname{SiLU}(W_1x)\odot W_3x\right).
+$$
+
+形状变化：
+
+```text
+x       [..., D]
+W1(x)   [..., F]
+W3(x)   [..., F]
+乘积     [..., F]
+W2(...) [..., D]
+```
+
+`W1` 产生带非线性的 gate，`W3` 产生被 gate 调制的内容，逐元素相乘后再由 `W2` 投回 $D$。因为输出回到 $D$，才能与 residual stream 相加。
+
+### 5.3 完整实现
+
+```python
+class SwiGLU(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+
+        self.w1 = Linear(
+            d_model,
+            d_ff,
+            device=device,
+            dtype=dtype,
+        )
+        self.w2 = Linear(
+            d_ff,
+            d_model,
+            device=device,
+            dtype=dtype,
+        )
+        self.w3 = Linear(
+            d_model,
+            d_ff,
+            device=device,
+            dtype=dtype,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(silu(self.w1(x)) * self.w3(x))
+```
+
+把三条权重写成三个 `Linear` 子模块，还有一个测试上的好处：`state_dict` 的 key 会自然成为：
+
+```text
+w1.weight
+w2.weight
+w3.weight
+```
+
+这与参考权重结构一致。若直接注册三个裸 `Parameter`，数值计算可以相同，但 state dict 接口会不同，`load_state_dict` 就无法按预期加载快照。
+
+## 6. Attention：先理解单头检索
+
+### 6.1 Q、K、V 各自做什么
+
+对序列中的每个 token，模型产生三个向量：
+
+- Query：我正在寻找什么；
+- Key：我可以用什么特征被匹配；
+- Value：如果被关注，我提供什么内容。
+
+对一个 query $q_i$ 和一个 key $k_j$，相似度使用点积：
+
+$$
+s_{ij}=q_i^\top k_j.
+$$
+
+把所有位置一次算完：
+
+$$
+S=QK^\top.
+$$
+
+若：
+
+```text
+Q [..., T_q, d_k]
+K [..., T_k, d_k]
+V [..., T_k, d_v]
+```
+
+则：
+
+```text
+Q @ K.transpose(-2, -1)  [..., T_q, T_k]
+attention @ V            [..., T_q, d_v]
+```
+
+不能使用 `K.T`。对二维矩阵，`.T` 恰好交换两个轴；对 `[B,H,T,d_k]`，`.T` 会反转所有轴。`transpose(-2,-1)` 才是只交换 key 的“序列轴”和“特征轴”。
+
+### 6.2 为什么除以 $\sqrt{d_k}$
+
+若 query 和 key 的每个分量近似独立、均值为 0、方差为 1，则点积是 $d_k$ 项之和，其方差约为 $d_k$，标准差约为 $\sqrt{d_k}$。维度越大，未经缩放的 logits 绝对值越大，softmax 越容易饱和成接近 one-hot，梯度也会变小。
+
+因此使用：
+
+$$
+\operatorname{Attention}(Q,K,V)
+=\operatorname{softmax}\left(
+\frac{QK^\top}{\sqrt{d_k}}
+\right)V.
+$$
+
+## 7. 稳定 softmax 与 mask
+
+### 7.1 为什么要减最大值
+
+softmax 定义为：
+
+$$
+\operatorname{softmax}(x_i)
+=\frac{e^{x_i}}{\sum_j e^{x_j}}.
+$$
+
+若 logits 中有 1000，直接计算 $e^{1000}$ 会溢出。但对所有元素减同一个常数不改变结果：
+
+$$
+\frac{e^{x_i-c}}{\sum_j e^{x_j-c}}
+=\frac{e^{x_i}/e^c}{\sum_j e^{x_j}/e^c}
+=\frac{e^{x_i}}{\sum_j e^{x_j}}.
+$$
+
+选择 $c=\max(x)$ 后，最大的指数是 $e^0=1$，其余都不大于 1。
+
+```python
+def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
+    maximum = x.max(dim=dim, keepdim=True).values
+    shifted = x - maximum
+    numerator = torch.exp(shifted)
+    denominator = numerator.sum(dim=dim, keepdim=True)
+    return numerator / denominator
+```
+
+这里两个 `keepdim=True` 都让张量保持可广播形状。例如 `[B,H,T,T]` 沿最后一维归约后得到 `[B,H,T,1]`。
+
+### 7.2 mask 的布尔语义
+
+本文约定：
+
+```text
+mask == True   允许关注
+mask == False  禁止关注
+```
+
+禁止位置在 softmax 前填为负无穷：
+
+```python
+scores = scores.masked_fill(~mask, -torch.inf)
+```
+
+因为 $e^{-\infty}=0$，这些位置的注意力概率正好为 0。mask 必须在 softmax **之前** 应用；若先 softmax 再把概率清零，剩余概率之和不再是 1。
+
+### 7.3 完整 scaled dot-product attention
+
+```python
+def scaled_dot_product_attention(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    d_k = Q.shape[-1]
+    scores = Q @ K.transpose(-2, -1)
+    scores = scores / math.sqrt(d_k)
+
+    if mask is not None:
+        scores = scores.masked_fill(~mask, -torch.inf)
+
+    attention_weights = softmax(scores, dim=-1)
+    return attention_weights @ V
+```
+
+这个函数没有写死 batch 或 head 轴。只要最后两维满足约定，前面的任意维度都由矩阵乘法和广播保留。因此它既能处理 3D，也能处理 `[B,H,T,d_h]` 的 4D 输入。
+
+## 8. 因果 mask：当前位置不能偷看未来
+
+自回归语言模型在位置 $i$ 只能使用位置 $j\le i$。对 $T=4$，允许矩阵是：
+
+```text
+[[True,  False, False, False],
+ [True,  True,  False, False],
+ [True,  True,  True,  False],
+ [True,  True,  True,  True ]]
+```
+
+可以不写循环，直接比较位置：
+
+```python
+positions = torch.arange(T, device=x.device)
+causal_mask = positions[:, None] >= positions[None, :]
+```
+
+左边是 query position，形状 `[T,1]`；右边是 key position，形状 `[1,T]`。广播后得到 `[T,T]`。例如第 2 行会比较：
+
+```text
+2 >= [0, 1, 2, 3] -> [True, True, True, False]
+```
+
+这个 `[T,T]` mask 会自动广播到 `[B,H,T,T]`，所以通常无需为每个 batch 和 head 复制一份。
+
+检验 causal mask 的最好办法不是只看形状，而是构造两个只在未来 token 上不同的输入：模型前面位置的输出应保持不变。
+
+## 9. 多头注意力：并行学习不同关系
+
+### 9.1 从 $D$ 拆成 $H\times d_h$
+
+先用四个 $D\to D$ 线性层完成 Q、K、V 和输出投影：
+
+$$
+Q=XW_Q^\top,\quad
+K=XW_K^\top,\quad
+V=XW_V^\top.
+$$
+
+每个结果最初都是 `[B,T,D]`。因为 $D=H\cdot d_h$，可以重排为：
+
+```text
+[B, T, D] -> [B, H, T, d_h]
+```
+
+这不是复制数据给每个 head，而是把最后一维分组。每个 head 在自己的 $d_h$ 子空间独立计算 attention，最后再拼回：
+
+```text
+[B, H, T, d_h] -> [B, T, D]
+```
+
+### 9.2 为什么还需要 output projection
+
+简单拼接只把多个 head 的结果并排摆放。`output_proj` 让不同 head 的信息重新线性混合，并把 attention 子层完整映射回 residual stream 的坐标系。
+
+### 9.3 `einops.rearrange` 明确表达轴语义
+
+```python
+Q = rearrange(
+    Q,
+    "... sequence (heads head_dim) -> ... heads sequence head_dim",
+    heads=self.num_heads,
+)
+```
+
+`...` 保留任意 leading dimensions，`sequence` 保持序列轴，最后的 $D$ 被拆为 `heads × head_dim`。这种写法比连续 `view`、`transpose` 更容易审查每个轴的含义。
+
+`T` 要从 `Q.shape[-2]` 读取。拆头后固定的最后两维是 `[sequence, head_dim]`；写 `Q.shape[2]` 只对刚好四维的输入成立，一旦出现额外 leading dimension 就会读错轴。
+
+## 10. RoPE：用旋转把相对位置写进 Q 和 K
+
+### 10.1 从二维旋转开始
+
+RoPE 把每两个相邻特征看作一个二维向量。位置 $p$、频率 $\omega_i$ 对应角度：
+
+$$
+\phi_{p,i}=p\omega_i.
+$$
+
+二维旋转矩阵为：
+
+$$
+R(\phi)=
+\begin{bmatrix}
+\cos\phi & -\sin\phi\\
+\sin\phi & \cos\phi
+\end{bmatrix}.
+$$
+
+因此一对特征 $(a,b)$ 被变换为：
+
+$$
+(a\cos\phi-b\sin\phi,\;
+ a\sin\phi+b\cos\phi).
+$$
+
+位置 0 时 $\phi=0$，所以 `cos(0)=1`、`sin(0)=0`，输出保持不变。这是最简单的 RoPE sanity check。
+
+### 10.2 不同维度为什么使用不同频率
+
+对第 $i$ 个二维 pair：
+
+$$
+\omega_i=\Theta^{-2i/d_k},
+\qquad i=0,1,\ldots,d_k/2-1.
+$$
+
+不同 pair 旋转速度不同：高频维度对短距离更敏感，低频维度能覆盖更长位置尺度。位置与频率相乘后形成 cache：
+
+```text
+positions   [max_seq_len]
+frequencies [d_k / 2]
+angles      [max_seq_len, d_k / 2]
+```
+
+### 10.3 为什么点积只依赖相对位置
+
+旋转矩阵是正交矩阵，因此：
+
+$$
+R_i^\top=R(-i).
+$$
+
+同一二维平面中的旋转可以相加：
+
+$$
+R(a)R(b)=R(a+b).
+$$
+
+所以：
+
+$$
+R_i^\top R_j
+=R(-i)R(j)
+=R(j-i).
+$$
+
+旋转后的 query 和 key 点积为：
+
+$$
+(R_iq_i)^\top(R_jk_j)
+=q_i^\top R_i^\top R_jk_j
+=q_i^\top R_{j-i}k_j.
+$$
+
+绝对位置 $i$ 和 $j$ 通过组合变成相对位移 $j-i$。这就是 RoPE 能让 attention 感知相对位置的核心原因。
+
+### 10.4 为什么只旋转 Q、K，不旋转 V
+
+Q 和 K 决定注意力权重，也就是“从哪里读取”；RoPE 要改变的正是位置间的匹配关系。V 是被读取的内容。若旋转 V，聚合内容本身也会随绝对位置进入不同坐标系，破坏这个清晰分工。
+
+RoPE 应在拆 head 之后应用，而且 `d_k` 使用每头维度 `d_head`，不是整个 `d_model`。每个 head 独立完成旋转和 attention。
+
+### 10.5 完整实现
+
+```python
+class RotaryPositionalEmbedding(nn.Module):
+    def __init__(
+        self,
+        theta: float,
+        d_k: int,
+        max_seq_len: int,
+        device=None,
+    ):
+        super().__init__()
+        assert d_k % 2 == 0
+
+        pair_indices = torch.arange(
+            d_k // 2,
+            device=device,
+            dtype=torch.float32,
+        )
+        frequencies = theta ** (-2 * pair_indices / d_k)
+
+        positions = torch.arange(
+            max_seq_len,
+            device=device,
+            dtype=torch.float32,
+        )
+        angles = positions[:, None] * frequencies[None, :]
+
+        self.register_buffer(
+            "cos_cache",
+            torch.cos(angles),
+            persistent=False,
+        )
+        self.register_buffer(
+            "sin_cache",
+            torch.sin(angles),
+            persistent=False,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        token_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        cos = self.cos_cache[token_positions].to(x.dtype)
+        sin = self.sin_cache[token_positions].to(x.dtype)
+
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+
+        out_even = x_even * cos - x_odd * sin
+        out_odd = x_even * sin + x_odd * cos
+
+        output = torch.stack((out_even, out_odd), dim=-1)
+        return output.flatten(-2)
+```
+
+`register_buffer` 表示 cache 是 module 状态，会跟随 `.to(device)` 移动，但不是可训练参数。`persistent=False` 又让它不进入 checkpoint，因为它可以由 `theta`、`d_k` 和 `max_seq_len` 重建。
+
+`token_positions` 可以是 `[T]` 或带 batch 轴的 `[...,T]`。在多头注意力中给它增加一个 head 广播轴：
+
+```python
+rope_positions = token_positions.unsqueeze(-2)
+```
+
+例如 `[B,T] -> [B,1,T]`，索引 cache 后得到 `[B,1,T,d_h/2]`，可以广播到 Q/K 的 `[B,H,T,d_h/2]`。
+
+### 10.6 RoPE 最容易写错的地方
+
+我的实现先后出现过这些问题：
+
+1. 构造函数名字拼错，module 根本没有正确初始化；
+2. 只算频率，没有乘位置，所有位置使用相同角度；
+3. 正弦交叉项符号写反，变成顺时针旋转；
+4. 在拆 head 前按 `d_model` 构造 RoPE；
+5. 测试只检查“相同位移点积相同”，却没有区分顺时针和逆时针约定。
+
+最后一个最隐蔽：错误方向仍可能保留相对位置性质，因此自制不变量测试会通过；官方数值快照使用确定旋转约定，才抓到符号错误。应同时验证：位置 0 恒等、范数保持、相对位移性质、明确的二维数值例子和参考快照。
+
+## 11. 完整多头自注意力实现
+
+现在把线性投影、拆头、causal mask、RoPE、scaled attention、合头和输出投影连起来：
+
+```python
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        theta: float | None = None,
+        max_seq_len: int | None = None,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        assert d_model % num_heads == 0
+
+        self.q_proj = Linear(
+            d_model, d_model, device=device, dtype=dtype
+        )
+        self.k_proj = Linear(
+            d_model, d_model, device=device, dtype=dtype
+        )
+        self.v_proj = Linear(
+            d_model, d_model, device=device, dtype=dtype
+        )
+        self.output_proj = Linear(
+            d_model, d_model, device=device, dtype=dtype
+        )
+
+        self.num_heads = num_heads
+        self.d_head = d_model // num_heads
+
+        if theta is not None and max_seq_len is not None:
+            self.rope = RotaryPositionalEmbedding(
+                theta=theta,
+                d_k=self.d_head,
+                max_seq_len=max_seq_len,
+                device=device,
+            )
+        else:
+            self.rope = None
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        token_positions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        Q = self.q_proj(x)
+        K = self.k_proj(x)
+        V = self.v_proj(x)
+
+        Q = rearrange(
+            Q,
+            "... sequence (heads head_dim)"
+            " -> ... heads sequence head_dim",
+            heads=self.num_heads,
+        )
+        K = rearrange(
+            K,
+            "... sequence (heads head_dim)"
+            " -> ... heads sequence head_dim",
+            heads=self.num_heads,
+        )
+        V = rearrange(
+            V,
+            "... sequence (heads head_dim)"
+            " -> ... heads sequence head_dim",
+            heads=self.num_heads,
+        )
+
+        T = Q.shape[-2]
+        positions = torch.arange(T, device=x.device)
+        causal_mask = positions[:, None] >= positions[None, :]
+
+        if self.rope is not None and token_positions is None:
+            token_positions = torch.arange(T, device=x.device)
+
+        if self.rope is not None:
+            rope_positions = token_positions.unsqueeze(-2)
+            Q = self.rope(Q, rope_positions)
+            K = self.rope(K, rope_positions)
+
+        output = scaled_dot_product_attention(
+            Q,
+            K,
+            V,
+            causal_mask,
+        )
+
+        output = rearrange(
+            output,
+            "... heads sequence head_dim"
+            " -> ... sequence (heads head_dim)",
+        )
+
+        return self.output_proj(output)
+```
+
+这段 forward 的逐行形状是：
+
+| 步骤 | 形状 |
+| --- | --- |
+| `x` | `[..., T, D]` |
+| `q_proj(x)` 等 | `[..., T, D]` |
+| 拆 head 后 Q/K/V | `[..., H, T, d_h]` |
+| causal mask | `[T, T]`，广播到前导轴 |
+| attention scores | `[..., H, T, T]` |
+| attention output | `[..., H, T, d_h]` |
+| 合 head | `[..., T, D]` |
+| output projection | `[..., T, D]` |
+
+`token_positions` 这个名字也应始终一致。我曾在接口中出现 `token_postions` 的拼写错误，调用方传入正确名字后，局部变量没有被赋值，最终触发 `UnboundLocalError`。形状问题之外，接口名也是不变量。
+
+## 12. TransformerBlock：pre-norm 与两条 residual
+
+### 12.1 数据流
+
+本文实现的是 pre-norm block：每个子层先归一化，再计算更新量，最后加回 residual stream。
+
+$$
+y=x+\operatorname{Attention}(\operatorname{RMSNorm}_1(x)),
+$$
+
+$$
+z=y+\operatorname{SwiGLU}(\operatorname{RMSNorm}_2(y)).
+$$
+
+注意第二行必须归一化并残差连接 **更新后的 $y$**，不是原始 $x$。attention 已经把新信息写进 residual stream，FFN 应当处理这个新状态。
+
+可以把 residual stream 理解为模型持续维护的一份 token 表示：attention 从其他位置读信息并写入一次，FFN 在每个位置内部计算后又写入一次。两个子层都不是替换已有表示，而是贡献一个 update。
+
+### 12.2 完整实现
+
+```python
+class TransformerBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        max_seq_len: int,
+        theta: float,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+
+        self.ln1 = RMSNorm(
+            d_model=d_model,
+            device=device,
+            dtype=dtype,
+        )
+        self.attn = MultiHeadSelfAttention(
+            d_model=d_model,
+            num_heads=num_heads,
+            theta=theta,
+            max_seq_len=max_seq_len,
+            device=device,
+            dtype=dtype,
+        )
+        self.ln2 = RMSNorm(
+            d_model=d_model,
+            device=device,
+            dtype=dtype,
+        )
+        self.ffn = SwiGLU(
+            d_model=d_model,
+            d_ff=d_ff,
+            device=device,
+            dtype=dtype,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        token_positions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        attention_input = self.ln1(x)
+        attention_update = self.attn(
+            attention_input,
+            token_positions,
+        )
+        y = x + attention_update
+
+        ffn_input = self.ln2(y)
+        ffn_update = self.ffn(ffn_input)
+        z = y + ffn_update
+
+        return z
+```
+
+这里每个中间 tensor 都是 `[...,T,D]`，所以两次加法合法。把中间量命名为 `attention_update` 和 `ffn_update`，比把所有表达式塞在一行更容易检查 residual 到底加到了谁身上。
+
+## 13. TransformerLM：从 token IDs 到 logits
+
+### 13.1 模块组成
+
+完整语言模型包含：
+
+1. 一个 token embedding；
+2. `num_layers` 个 Transformer block；
+3. 一个 final RMSNorm；
+4. 一个 $D\to V$ 的 LM head。
+
+`nn.ModuleList` 不是普通 Python list。它会注册每一层的参数，使 `.parameters()`、`.state_dict()`、`.to(device)` 和 checkpoint 都能递归看到这些 block。
+
+### 13.2 完整实现
+
+```python
+class TransformerLM(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        context_length: int,
+        d_model: int,
+        num_layers: int,
+        num_heads: int,
+        d_ff: int,
+        rope_theta: float,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+
+        self.token_embeddings = Embedding(
+            vocab_size,
+            d_model,
+            device=device,
+            dtype=dtype,
+        )
+
+        self.layers = nn.ModuleList(
+            TransformerBlock(
+                d_model=d_model,
+                num_heads=num_heads,
+                d_ff=d_ff,
+                max_seq_len=context_length,
+                theta=rope_theta,
+                device=device,
+                dtype=dtype,
+            )
+            for _ in range(num_layers)
+        )
+
+        self.ln_final = RMSNorm(
+            d_model=d_model,
+            device=device,
+            dtype=dtype,
+        )
+        self.lm_head = Linear(
+            d_model,
+            vocab_size,
+            device=device,
+            dtype=dtype,
+        )
+
+    def forward(self, in_indices: torch.Tensor) -> torch.Tensor:
+        T = in_indices.shape[-1]
+        token_positions = torch.arange(
+            T,
+            device=in_indices.device,
+        )
+
+        x = self.token_embeddings(in_indices)
+
+        for layer in self.layers:
+            x = layer(x, token_positions)
+
+        x = self.ln_final(x)
+        logits = self.lm_head(x)
+        return logits
+```
+
+### 13.3 为什么实际序列可以短于 context length
+
+`context_length` 是 RoPE cache 的最大长度，不是每次输入必须达到的固定长度。forward 从输入的最后一维读取实际 $T$：
+
+```python
+T = in_indices.shape[-1]
+token_positions = torch.arange(T, device=in_indices.device)
+```
+
+因此 `[B,context_length]` 和截短后的 `[B,T_short]` 都能运行，只要 $T\le context\_length$。对应的 `test_transformer_lm_truncated_input` 专门验证这一点。
+
+### 13.4 为什么 device 和 dtype 要一路传递
+
+参考测试会提供一份固定权重，并要求自定义模型加载它们。如果构造 `token_embeddings` 或 `lm_head` 时遗漏 `device`、`dtype`，模型可能一部分是 CPU float32，另一部分是目标设备或 float64，最终在加载或矩阵乘法时失败。
+
+我额外做过 float64 小模型检查：所有 parameter dtype 都是 `torch.float64`，输入 `[2,5]` 得到的输出形状是 `[2,5,32]`，dtype 仍是 float64，且所有 logits 都是有限值。
+
+## 14. 一次完整前向传播的形状跟踪
+
+现在用：
+
+```text
+B=2, T=4, V=1000, D=24, H=3, d_h=8, F=64, N=2
+```
+
+完整跟踪一次：
+
+1. 输入 token IDs：`[2,4]`。
+2. embedding 查表：`[2,4,24]`。
+3. 第一层 `ln1`：形状不变 `[2,4,24]`。
+4. Q/K/V 三次投影：各 `[2,4,24]`。
+5. 拆成 3 个 head：各 `[2,3,4,8]`。
+6. RoPE：偶数/奇数维各 `[2,3,4,4]`，重组后 `[2,3,4,8]`。
+7. `Q @ K.transpose(-2,-1)`：`[2,3,4,4]`。
+8. causal mask `[4,4]` 广播到 score。
+9. softmax 沿 key 轴 `-1`：仍为 `[2,3,4,4]`，每一行和为 1。
+10. attention weights 乘 V：`[2,3,4,8]`。
+11. 合 head：`[2,4,24]`。
+12. output projection：`[2,4,24]`。
+13. 第一次 residual：`y=[2,4,24]`。
+14. `ln2(y)`：`[2,4,24]`。
+15. `w1(y)`、`w3(y)`：各 `[2,4,64]`。
+16. gate 逐元素乘：`[2,4,64]`。
+17. `w2` 投回：`[2,4,24]`。
+18. 第二次 residual：第一层输出 `[2,4,24]`。
+19. 第二层重复相同形状。
+20. final norm：`[2,4,24]`。
+21. LM head：`[2,4,1000]`。
+
+只要中途某一步不符合这条链，就先停止写后续代码。形状检查是最便宜、最有效的 Transformer 调试手段。
+
+## 15. 参数量：每个结构到底占多少权重
+
+下面假设所有 Linear 都无 bias，embedding 和 LM head **不共享权重**。
+
+### 15.1 单个组件
+
+| 组件 | 参数量 |
+| --- | ---: |
+| token embedding `[V,D]` | $VD$ |
+| Q/K/V 三个投影 | $3D^2$ |
+| attention output projection | $D^2$ |
+| 两个 RMSNorm gain | $2D$ |
+| SwiGLU `W1`、`W3` | $2FD$ |
+| SwiGLU `W2` | $DF$ |
+| final RMSNorm | $D$ |
+| LM head `[V,D]` | $VD$ |
+
+所以一个 Transformer block 为：
+
+$$
+P_{block}=4D^2+3DF+2D.
+$$
+
+完整模型为：
+
+$$
+P_{model}
+=2VD+N(4D^2+3DF+2D)+D.
+$$
+
+若 embedding 与 LM head 权重绑定，第一项从 $2VD$ 变为 $VD$；本文实现没有绑定，因此必须计算两次。
+
+### 15.2 用代码核对推导
+
+```python
+def count_parameters(model: nn.Module) -> int:
+    return sum(parameter.numel() for parameter in model.parameters())
+
+
+expected = (
+    2 * V * D
+    + N * (4 * D * D + 3 * D * F + 2 * D)
+    + D
+)
+
+assert count_parameters(model) == expected
+```
+
+公式和代码对不上时，不要先怀疑 PyTorch。逐项打印 `named_parameters()`，通常能发现漏注册子模块、意外 bias、权重共享或重复参数。
+
+## 16. 前向矩阵乘法 FLOPs
+
+一次 `[M,K] @ [K,N]` 的矩阵乘法约为 $2MKN$ FLOPs，因为每个输出需要 $K$ 次乘法和约 $K$ 次加法。
+
+对 batch $B$、序列 $T$ 的一个 block：
+
+### 16.1 attention 投影
+
+Q、K、V 各是 `[BT,D] @ [D,D]`：
+
+$$
+3\times2BTD^2=6BTD^2.
+$$
+
+输出投影再需要：
+
+$$
+2BTD^2.
+$$
+
+四个投影合计：
+
+$$
+8BTD^2.
+$$
+
+### 16.2 attention 的两个序列矩阵乘法
+
+所有 head 的 $QK^\top$ 合计：
+
+$$
+2BHT^2d_h=2BT^2D.
+$$
+
+attention weights 乘 V 同量级，再来一次：
+
+$$
+2BT^2D.
+$$
+
+合计：
+
+$$
+4BT^2D.
+$$
+
+这里出现 $T^2$，所以标准 attention 在长上下文时成本增长很快。
+
+### 16.3 SwiGLU
+
+`W1`、`W3` 两次 $D\to F$ 和 `W2` 一次 $F\to D$：
+
+$$
+2BTDF+2BTDF+2BTFD=6BTDF.
+$$
+
+### 16.4 单 block 与完整模型
+
+忽略 norm、RoPE、softmax 和逐元素激活等较小项，一个 block 的主要前向 FLOPs 是：
+
+$$
+C_{block}
+\approx8BTD^2+4BT^2D+6BTDF.
+$$
+
+$N$ 层后，再加 LM head：
+
+$$
+C_{forward}
+\approx N C_{block}+2BTDV.
+$$
+
+embedding 是查表，不按 dense matrix multiplication 计算。这里是结构级估算，不是硬件运行时间；实际性能还取决于 kernel fusion、内存带宽、dtype 和并行策略。
+
+## 17. 测试顺序：每次只扩大一个正确性边界
+
+我实际采用的顺序是：
+
+```bash
+uv run pytest -k test_linear -q
+uv run pytest -k test_embedding -q
+uv run pytest -k test_rmsnorm -q
+uv run pytest -k test_silu -q
+uv run pytest -k test_swiglu -q
+uv run pytest -k test_scaled_dot_product_attention -q
+uv run pytest -k test_rope -q
+uv run pytest tests/test_model.py::test_multihead_self_attention -q
+uv run pytest tests/test_model.py::test_multihead_self_attention_with_rope -q
+uv run pytest tests/test_model.py::test_transformer_block -q
+uv run pytest tests/test_model.py::test_transformer_lm -q
+uv run pytest tests/test_model.py -q
+```
+
+为什么不一开始就跑完整 LM？因为最终输出不匹配时，可能来自 Linear、RoPE、mask、head reshape、residual、FFN 或 adapter 权重加载。逐层通过会显著缩小错误搜索空间。
+
+最终完整结果：
+
+```text
+tests/test_model.py::test_linear PASSED
+tests/test_model.py::test_embedding PASSED
+tests/test_model.py::test_swiglu PASSED
+tests/test_model.py::test_scaled_dot_product_attention PASSED
+tests/test_model.py::test_4d_scaled_dot_product_attention PASSED
+tests/test_model.py::test_multihead_self_attention PASSED
+tests/test_model.py::test_multihead_self_attention_with_rope PASSED
+tests/test_model.py::test_transformer_lm PASSED
+tests/test_model.py::test_transformer_lm_truncated_input PASSED
+tests/test_model.py::test_transformer_block PASSED
+tests/test_model.py::test_rmsnorm PASSED
+tests/test_model.py::test_rope PASSED
+tests/test_model.py::test_silu_matches_pytorch PASSED
+
+13 passed in 0.19s
+```
+
+这证明当前 forward 与课程参考快照一致，但边界要说清楚：它验证的是这一组 model 组件；loss、optimizer、batch sampler 和训练循环仍是后续任务，不能因为 `test_model.py` 全绿就说整个 Assignment 1 已完成。
+
+## 18. 除了快照，还应该主动检查哪些不变量
+
+### Linear / Embedding
+
+```python
+assert Linear(8, 12)(torch.randn(2, 4, 8)).shape == (2, 4, 12)
+assert Embedding(1000, 8)(torch.zeros(2, 4, dtype=torch.long)).shape == (2, 4, 8)
+```
+
+### RMSNorm
+
+```python
+x = torch.randn(2, 4, 8)
+y = RMSNorm(8)(x)
+
+assert y.shape == x.shape
+assert torch.isfinite(y).all()
+```
+
+把 gain 暂时看作全 1 且忽略 epsilon 时，每个向量归一化后的 `mean(y**2)` 应接近 1。
+
+### softmax
+
+```python
+x = torch.tensor([[1000.0, 1001.0, 1002.0]])
+p = softmax(x, dim=-1)
+
+assert torch.isfinite(p).all()
+assert torch.allclose(p.sum(dim=-1), torch.ones(1))
+```
+
+### attention
+
+```python
+Q = torch.randn(2, 3, 5, 8)
+K = torch.randn(2, 3, 5, 8)
+V = torch.randn(2, 3, 5, 6)
+out = scaled_dot_product_attention(Q, K, V)
+
+assert out.shape == (2, 3, 5, 6)
+```
+
+### RoPE
+
+```python
+rope = RotaryPositionalEmbedding(theta=10_000, d_k=8, max_seq_len=16)
+x = torch.randn(2, 5, 8)
+positions = torch.arange(5)
+y = rope(x, positions)
+
+assert torch.allclose(y[:, 0], x[:, 0])
+assert torch.allclose(
+    y.square().sum(dim=-1),
+    x.square().sum(dim=-1),
+    atol=1e-5,
+)
+```
+
+位置 0 恒等检查不了旋转方向，范数保持也检查不了方向，所以仍需要一个手算二维例子或参考快照。
+
+### 完整 LM
+
+```python
+model = TransformerLM(
+    vocab_size=32,
+    context_length=8,
+    d_model=16,
+    num_layers=2,
+    num_heads=4,
+    d_ff=48,
+    rope_theta=10_000,
+    dtype=torch.float64,
+)
+
+token_ids = torch.randint(0, 32, (2, 5))
+logits = model(token_ids)
+
+assert logits.shape == (2, 5, 32)
+assert logits.dtype == torch.float64
+assert torch.isfinite(logits).all()
+```
+
+## 19. 这次真正遇到的错误，以及为什么错
+
+| 症状 | 根因 | 正确不变量 |
+| --- | --- | --- |
+| `Linear has no attribute detach` | 把整个 `Linear` 传给 `nn.Parameter` | module 直接注册；只有 tensor 包成 Parameter |
+| SwiGLU 数值像是对的，但权重加载失败 | state dict key 与参考结构不同 | 使用 `w1.weight`、`w2.weight`、`w3.weight` |
+| 极端负数 SiLU 梯度为 NaN | 手写 `exp(-x)` 溢出 | 使用稳定的 `torch.sigmoid` |
+| 2D attention 通过，4D 失败 | 使用 `K.T` 反转了所有轴 | 只交换最后两维 |
+| mask 后概率不归一 | 在 softmax 后清零 | softmax 前把禁止 logits 填成 `-inf` |
+| 多头代码只支持固定四维 | 用 `shape[2]` 读取序列长度 | 最后两维语义固定，使用 `shape[-2]` |
+| RoPE 所有位置效果相同 | angle 没有乘 position | `angles = positions[:,None] * frequencies[None,:]` |
+| RoPE 相对性质通过但快照失败 | 旋转正负号与约定相反 | 加入明确方向的二维数值测试 |
+| RoPE 维度或广播错误 | 在拆 head 前应用，或 position 缺 head 轴 | 对 Q/K 拆头后按 `d_head` 旋转 |
+| `UnboundLocalError` | `token_postions` / `token_positions` 拼写不一致 | adapter、module 和调用点统一接口名 |
+| block 数值错误 | 第二个 norm/残差仍使用原始 x | `y=x+attn(...)` 后，FFN 路径使用 y |
+| float64/device 测试失败 | 某些子模块没传播构造参数 | 所有 Parameter 构造都传 device/dtype |
+| LM 输出概率而非参考 logits | 在 model forward 里提前 softmax | LM head 返回 raw logits |
+
+这些错误看起来分散，其实都能归到三类：
+
+1. **轴语义错误**：转置、拆头和广播没有围绕最后两维不变量；
+2. **状态接口错误**：module、Parameter、state dict、device/dtype 没有统一；
+3. **数值约定错误**：稳定 softmax、SiLU 极端值、RoPE 旋转方向与 mask 语义不清楚。
+
+## 20. 最后把整个模型压缩成四行数学
+
+虽然实现很长，TransformerLM 的主干可以压缩为：
+
+$$
+x_0=\operatorname{Embedding}(\text{token IDs}),
+$$
+
+$$
+y_l=x_l+\operatorname{MHA}(\operatorname{RMSNorm}_{l,1}(x_l)),
+$$
+
+$$
+x_{l+1}=y_l+\operatorname{SwiGLU}(\operatorname{RMSNorm}_{l,2}(y_l)),
+$$
+
+$$
+\text{logits}
+=W_{LM}\operatorname{RMSNorm}_{final}(x_N).
+$$
+
+但“能写出这四行”与“真正理解实现”之间，还隔着 Q/K/V 的形状、causal mask 的方向、RoPE 的旋转约定、稳定 softmax、module 注册和 residual 数据流。逐层实现的价值就在这里：抽象不再是需要背诵的名词，而是每一个都能用形状、公式、代码和测试解释的具体对象。
+
+接下来，模型已经能产生 `[B,T,V]` logits。训练它还需要四块：从 `uint16` memmap 采样 `(inputs, targets)`、稳定 cross entropy、AdamW 与 cosine learning-rate schedule，以及包含梯度裁剪和 checkpoint 的训练循环。那些属于 Transformer **训练**，会在下一篇单独展开；本文到“完整模型前向通过 13 项定向测试”为止。

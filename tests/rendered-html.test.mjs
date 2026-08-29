@@ -30,6 +30,7 @@ test("首页呈现正式品牌、精选旧文且不会重复", async () => {
   assert.match(html, /记录技术、生活与思考/);
   assert.match(html, /src="\/og\.png"/);
   assert.match(html, /算法竞赛进阶指南：基本算法与数据结构/);
+  assert.match(html, /CS336 Transformer 从零实现：从张量形状到完整语言模型/);
   assert.match(html, /CS336 train_bpe 实战：从正确实现到 3\.5 倍性能优化/);
   assert.match(html, /CS336 第二讲笔记：PyTorch、显存与计算资源核算/);
   assert.doesNotMatch(html, /target="_top"/);
@@ -72,6 +73,7 @@ test("主要页面和聚合页均可渲染", async () => {
     "/posts/karpathy-build-gpt-tokenizer",
     "/posts/cs336-train-bpe-performance",
     "/posts/cs336-lecture-02-pytorch-resource-accounting",
+    "/posts/cs336-transformer-from-scratch",
     "/about",
     "/categories",
     "/categories/%E6%8A%80%E6%9C%AF",
@@ -170,9 +172,47 @@ test("CS336 train_bpe 实战保留性能数据、代码与关联阅读", async (
   assert.match(visibleText, /assert parallel_counts == serial_counts/);
   assert.match(html, /145\.602 秒/);
   assert.match(html, /merge 循环约快了 8\.8 倍/);
+  assert.match(html, /3,340,216,780 tokens/);
+  assert.match(html, /uint16/);
+  assert.match(html, /更新于.*2026年8月29日/);
   assert.match(html, /href="\/posts\/cs336-lecture-01-overview-tokenization"/);
   assert.match(html, /href="\/posts\/karpathy-build-gpt-tokenizer"/);
+  assert.match(html, /href="\/posts\/cs336-transformer-from-scratch"/);
   assert.match(html, /property="og:title" content="CS336 train_bpe 实战/);
+  assert.match(html, /name="twitter:card" content="summary"/);
+  assert.doesNotMatch(html, /property="og:image"/);
+  assert.doesNotMatch(html, /name="twitter:image"/);
+});
+
+test("CS336 Transformer 长文覆盖完整前向、形状推导和调试记录", async () => {
+  const response = await render("/posts/cs336-transformer-from-scratch");
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  const visibleText = html.replace(/<[^>]+>/g, "");
+  assert.match(
+    html,
+    /CS336 Transformer 从零实现：从张量形状到完整语言模型/,
+  );
+  assert.match(html, /class="toc"/);
+  assert.match(html, /class="katex-display"/);
+  assert.match(html, /data-rehype-pretty-code-figure/);
+  assert.match(visibleText, /class MultiHeadSelfAttention/);
+  assert.match(visibleText, /class RotaryPositionalEmbedding/);
+  assert.match(visibleText, /class TransformerBlock/);
+  assert.match(visibleText, /class TransformerLM/);
+  assert.match(visibleText, /K\.transpose\(-2, -1\)/);
+  assert.match(html, /R_i\^\\top R_j/);
+  assert.match(html, /13 passed in 0\.19s/);
+  assert.match(html, /4D\^2\+3DF\+2D/);
+  assert.match(html, /href="\/posts\/cs336-train-bpe-performance"/);
+  assert.match(
+    html,
+    /href="\/posts\/cs336-lecture-02-pytorch-resource-accounting"/,
+  );
+  assert.match(
+    html,
+    /property="og:title" content="CS336 Transformer 从零实现/,
+  );
   assert.match(html, /name="twitter:card" content="summary"/);
   assert.doesNotMatch(html, /property="og:image"/);
   assert.doesNotMatch(html, /name="twitter:image"/);
@@ -255,6 +295,7 @@ test("RSS、站点地图和 robots 只包含已发布内容", async () => {
   assert.match(rssText, /Karpathy Tokenizer 视频笔记/);
   assert.match(rssText, /CS336 train_bpe 实战/);
   assert.match(rssText, /CS336 第二讲笔记/);
+  assert.match(rssText, /CS336 Transformer 从零实现/);
 
   const sitemap = await render("/sitemap.xml");
   assert.equal(sitemap.status, 200);
@@ -278,6 +319,7 @@ test("RSS、站点地图和 robots 只包含已发布内容", async () => {
     sitemapText,
     /\/posts\/cs336-lecture-02-pytorch-resource-accounting/,
   );
+  assert.match(sitemapText, /\/posts\/cs336-transformer-from-scratch/);
   assert.match(sitemapText, /\/categories\/%E6%8A%80%E6%9C%AF/);
   assert.match(sitemapText, /\/categories\/%E9%9A%8F%E7%AC%94/);
 

@@ -2,6 +2,7 @@
 title: "CS336 train_bpe 实战：从正确实现到 3.5 倍性能优化"
 description: "复盘我实现 byte-level BPE 训练器的过程：预分词、增量 pair 统计、多进程分块、性能分析，以及一个被反复扫描的零计数集合如何成为真正瓶颈。"
 publishedAt: "2026-08-18"
+updatedAt: "2026-08-29"
 category: "技术"
 tags:
   - "CS336"
@@ -537,6 +538,345 @@ if __name__ == "__main__":
 
 并行进程下，这个 maximum RSS 数字不应简单理解成所有 worker 同一时刻内存的总和，因此报告结果时也应该保留测量命令和指标名称。
 
+## 更新：从 BPE trainer 走到可训练的二进制语料
+
+前面的版本停在“学出 `vocab` 和 `merges`”。这还不是语言模型真正读取的数据。完整链路还要继续经过四步：
+
+```text
+原始 UTF-8 文本
+  -> train_bpe 学习 vocab / merges
+  -> Tokenizer 用 merge rank 编码新文本
+  -> 流式写出 uint16 token ID
+  -> 用 memmap 读取并抽样训练 batch
+```
+
+这一节补全后，`train_bpe` 不再是孤立函数，而是已经接上了 Transformer 训练的数据入口。
+
+### 为什么把 bytes 保存成十六进制 JSON
+
+词表中的值是任意 `bytes`，其中可能包含不可打印字节，也未必能单独解码成合法 UTF-8。直接把它们当字符串写入 JSON 会丢失信息。因此我把每个 token 序列化为十六进制字符串：
+
+```python
+vocab_data = {
+    str(token_id): token_bytes.hex()
+    for token_id, token_bytes in vocab.items()
+}
+merges_data = [
+    [left.hex(), right.hex()]
+    for left, right in merges
+]
+
+vocab_path.write_text(
+    json.dumps(vocab_data),
+    encoding="utf-8",
+)
+merges_path.write_text(
+    json.dumps(merges_data),
+    encoding="utf-8",
+)
+```
+
+读取时做完全可逆的反变换：
+
+```python
+raw_vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
+vocab = {
+    int(token_id): bytes.fromhex(token_hex)
+    for token_id, token_hex in raw_vocab.items()
+}
+
+raw_merges = json.loads(merges_path.read_text(encoding="utf-8"))
+merges = [
+    (bytes.fromhex(left), bytes.fromhex(right))
+    for left, right in raw_merges
+]
+```
+
+十六进制会让 JSON 比原始 bytes 更大，但 tokenizer 文件只加载一次，而且这种表示简单、无歧义、容易人工检查。
+
+### 编码不是“把所有可合并 pair 一起合并”
+
+训练得到的 `merges` 是有顺序的。越早学到的 pair，rank 越小，编码时优先级越高：
+
+```python
+self.merge_ranks = {
+    pair: rank
+    for rank, pair in enumerate(merges)
+}
+```
+
+对一个 pre-token 编码时，先把 UTF-8 拆成单字节 pieces，然后反复完成：
+
+1. 查看当前所有相邻 pair；
+2. 找到 rank 最小、也就是训练时最早出现的 pair；
+3. 从左到右非重叠地合并这个 pair；
+4. 重新观察新的相邻关系，直到再也没有已知 pair。
+
+实际实现如下：
+
+```python
+def _apply_merges(self, pieces: list[bytes]) -> list[bytes]:
+    while True:
+        min_rank = float("inf")
+
+        for pair in zip(pieces, pieces[1:]):
+            rank = self.merge_ranks.get(pair, float("inf"))
+            min_rank = min(min_rank, rank)
+
+        if min_rank == float("inf"):
+            break
+
+        pair = self.merges[min_rank]
+        merged_bytes = pair[0] + pair[1]
+        new_pieces: list[bytes] = []
+        i = 0
+
+        while i < len(pieces):
+            if (
+                i + 1 < len(pieces)
+                and (pieces[i], pieces[i + 1]) == pair
+            ):
+                new_pieces.append(merged_bytes)
+                i += 2
+            else:
+                new_pieces.append(pieces[i])
+                i += 1
+
+        pieces = new_pieces
+
+    return pieces
+```
+
+我曾经写过下面这种条件：
+
+```python
+self.merge_ranks[(pieces[i], pieces[i + 1])] == min_rank
+```
+
+它有两个问题。第一，当前 pair 可能根本不在字典里，直接索引会抛出 `KeyError`；第二，真正需要合并的是本轮已经选定的 `pair`，直接比较 `(pieces[i], pieces[i + 1]) == pair` 更明确，也不会再次把“查 rank”和“执行 merge”混在一起。
+
+### 特殊 token 为什么要先保留下来
+
+普通文本使用 GPT 风格正则预分词；特殊 token 则必须整体变成一个 ID，不能送入普通 BPE。带捕获组的 `re.split` 会把分隔符也保留在结果中：
+
+```python
+sorted_special_tokens = sorted(
+    self.special_tokens,
+    key=len,
+    reverse=True,
+)
+pattern = "|".join(
+    re.escape(token)
+    for token in sorted_special_tokens
+)
+segments = re.split(f"({pattern})", text)
+```
+
+假设文本是：
+
+```text
+first<|endoftext|>second
+```
+
+结果会近似是：
+
+```python
+["first", "<|endoftext|>", "second"]
+```
+
+遍历时，特殊 token 直接查 `token_to_id`；其他片段才调用普通编码：
+
+```python
+for segment in segments:
+    if not segment:
+        continue
+    if segment in special_token_set:
+        ids.append(self.token_to_id[segment.encode("utf-8")])
+    else:
+        ids.extend(self._encode_normal_text(segment))
+```
+
+这里按长度降序排列和训练预分词时理由相同：若多个特殊 token 存在前缀关系，应当先匹配更长的那个。
+
+### 解码为何最后才处理 UTF-8
+
+一个 token 的 bytes 不保证能独立解码。例如 `é` 的 UTF-8 是 `b'\xc3\xa9'`，单独解码 `b'\xc3'` 会失败。正确顺序是先把所有 token bytes 拼起来，再统一解码：
+
+```python
+def decode(self, ids: list[int]) -> str:
+    token_bytes = b"".join(self.vocab[token_id] for token_id in ids)
+    return token_bytes.decode("utf-8", errors="replace")
+```
+
+`errors="replace"` 让任意 ID 序列都有定义良好的输出；对合法文本的 `encode -> decode` 往返，不会产生替换字符。
+
+### 压缩率与吞吐量分别回答什么
+
+压缩率使用 bytes/token：
+
+$$
+\text{bytes per token}
+=\frac{\text{UTF-8 bytes}}{\text{token count}}.
+$$
+
+数值越大，表示平均一个 token 覆盖的原始字节越多。但它不是“越大永远越好”：词表更大需要更大的输出层，而且跨域 tokenizer 的切分行为也可能不同。
+
+我用固定随机种子的 reservoir sampling 抽取文档，避免只取文件开头；吞吐量先预热，再重复三轮取中位数。实测结果是：
+
+| tokenizer / 文本 | bytes/token |
+| --- | ---: |
+| TinyStories tokenizer / TinyStories | 4.0645 |
+| OWT tokenizer / OWT | 4.3483 |
+| TinyStories tokenizer / OWT | 3.2405 |
+
+OWT tokenizer 的编码吞吐量为约 `739,118 bytes/s`。若简单线性外推到 825 GB 的 Pile，单进程约需 12.92 天。这个估算不是实际生产承诺，因为磁盘、文档长度分布、并行度和机器都会改变结果；它的作用是尽早说明“完整语料不能靠一次随手运行解决”。
+
+### 为什么二进制文件选择小端 `uint16`
+
+TinyStories 词表有 10,000 项，OWT 词表有 32,000 项，token ID 都小于 $2^{16}=65536$。因此每个 ID 可以固定占 2 bytes：
+
+```python
+if min_id < 0 or max_id >= 2**16:
+    raise ValueError(
+        f"Token IDs must fit uint16, got range {min_id}–{max_id}"
+    )
+
+np.asarray(ids, dtype="<u2").tofile(output_file)
+```
+
+`<u2` 的含义是：
+
+- `<`：little-endian，小端；
+- `u`：unsigned integer，无符号整数；
+- `2`：每个元素 2 bytes。
+
+固定端序比依赖机器原生端序更利于复现。以后读取时要使用同一个 dtype：
+
+```python
+dataset = np.memmap(path, dtype="<u2", mode="r")
+```
+
+不能为了省空间直接写 `uint16` 而不检查 ID 范围；否则词表超过 65,536 时会发生静默截断，文件仍能生成，但训练数据已经损坏。
+
+### 流式切分避免把整份 OWT 放进内存
+
+原始文件用 `<|endoftext|>` 分隔文档。每次读取 1 MiB 时，特殊 token 可能横跨两个 chunk，所以必须保留末尾未完成的 `buffer`：
+
+```python
+def iter_text_segments(
+    path,
+    special_token="<|endoftext|>",
+    chunk_size=1024 * 1024,
+):
+    buffer = ""
+
+    with open(path, encoding="utf-8") as file:
+        while chunk := file.read(chunk_size):
+            buffer += chunk
+            pieces = buffer.split(special_token)
+
+            for document in pieces[:-1]:
+                yield document
+                yield special_token
+
+            buffer = pieces[-1]
+
+    if buffer:
+        yield buffer
+```
+
+`pieces[:-1]` 都已经由完整分隔符终止，可以安全交给 tokenizer；`pieces[-1]` 可能只是下一篇文档的前半段，必须留到下一轮。特殊 token 也重新 `yield`，否则文档边界会从训练序列里消失。
+
+编码器只保留一个 segment 的 ID，然后立刻写盘：
+
+```python
+def encode_dataset(tokenizer, input_path, output_path):
+    min_id = min(tokenizer.vocab)
+    max_id = max(tokenizer.vocab)
+
+    if min_id < 0 or max_id >= 2**16:
+        raise ValueError("token IDs do not fit uint16")
+
+    total_tokens = 0
+
+    with open(output_path, "wb") as output_file:
+        for segment_index, segment in enumerate(
+            iter_text_segments(input_path),
+            start=1,
+        ):
+            ids = tokenizer.encode(segment)
+
+            if ids:
+                np.asarray(ids, dtype="<u2").tofile(output_file)
+                total_tokens += len(ids)
+
+            if segment_index % 10_000 == 0:
+                print(
+                    f"{output_path.name}: "
+                    f"{segment_index} segments, "
+                    f"{total_tokens} tokens",
+                    flush=True,
+                )
+
+    return total_tokens
+```
+
+### 临时文件让“存在”真正表示“已完成”
+
+长任务如果直接写最终文件名，中途退出也会留下一个看似存在、实际不完整的 `.bin`。下次脚本若只用 `output_path.exists()` 判断，就会错误跳过它。
+
+我的批处理先写 `.bin.tmp`，完成后再原子替换为正式文件：
+
+```python
+temporary_path = output_path.with_suffix(".bin.tmp")
+
+total_tokens = encode_dataset(
+    tokenizer,
+    input_path,
+    temporary_path,
+)
+
+temporary_path.replace(output_path)
+```
+
+这样正式 `.bin` 只在完整编码成功后出现。任务结束时还要检查没有残留 `.tmp`，不能仅凭最后一条日志判断完成。
+
+### 四份语料的最终结果
+
+四个文件已经全部完成：
+
+| 文件 | token 数 | 文件字节数 | 编码时间 | token ID 范围 |
+| --- | ---: | ---: | ---: | ---: |
+| `tinystories_train.bin` | 541,229,347 | 1,082,458,694 | 2,781.191 秒 | 9–9,999 |
+| `tinystories_valid.bin` | 5,465,883 | 10,931,766 | 24.354 秒 | 10–9,999 |
+| `owt_train.bin` | 2,727,120,452 | 5,454,240,904 | 12,652.514 秒 | 10–31,999 |
+| `owt_valid.bin` | 66,401,098 | 132,802,196 | 269.999 秒 | 10–31,999 |
+
+合计是 **3,340,216,780 tokens**。整批长任务的墙钟时间为 15,703.95 秒，也就是约 4 小时 21 分 44 秒；`maximum resident set size` 为 172,376,064 bytes，约 164.39 MiB。
+
+每个文件都满足一个非常有力的结构检查：
+
+$$
+\text{file bytes}=2\times\text{token count}.
+$$
+
+例如 OWT train：
+
+$$
+2\times2{,}727{,}120{,}452
+=5{,}454{,}240{,}904.
+$$
+
+最终核验不只看文件大小，还包括：
+
+1. 四个正式文件全部存在；
+2. 没有遗留 `.tmp`；
+3. 都能以 `np.memmap(..., dtype="<u2")` 打开；
+4. 完整扫描所得最小、最大 ID 都落在各自词表范围；
+5. token 数等于文件大小除以 2。
+
+到这里，tokenizer 阶段才算真正闭环：不是“程序打印了 completed”，而是训练产物、编码语义、文件格式和消费者读取方式彼此一致。
+
 ## 这次实现留下的几个方法论
 
 ### 1. 先定义不变量，再谈优化
@@ -565,3 +905,5 @@ if __name__ == "__main__":
 - 对大文件提供流式 `encode_iterable`，避免一次读入全部文本。
 
 这次 BPE trainer 的实现让我第一次真正体会到 CS336 所强调的效率视角：算法正确只是起点；测量资源、维护状态不变量，并用实验区分直觉和事实，才是“从头构建”最值得学习的部分。
+
+完成 token IDs 后，下一站就是把 `[batch, sequence]` 的整数输入变成 `[batch, sequence, vocab]` 的 next-token logits。完整实现见[《CS336 Transformer 从零实现：从张量形状到完整语言模型》](/posts/cs336-transformer-from-scratch)。
