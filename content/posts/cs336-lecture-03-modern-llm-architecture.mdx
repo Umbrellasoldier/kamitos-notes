@@ -16,7 +16,23 @@ draft: false
 
 这篇文章整理 Stanford CS336 第三讲 **Everything You Didn't Want to Know About LM Architecture and Hyperparameters**。我同时参考了[第三讲视频（第 3 集）](https://www.bilibili.com/video/BV11LEA6eEuj/?p=3)和 Stanford 官方的 [lecture_03.pdf](https://github.com/stanford-cs336/lectures/blob/main/lecture_03.pdf)。视频负责把问题讲得直观，讲义负责给出模型家族、实验观察和公式；下面再把它们和我在 Assignment 1 中真正写出的代码接起来。
 
-补充一个来源说明：我在登录 Bilibili 后确认该页面提供“中文 AI”字幕，但播放器没有暴露可复制的完整字幕稿。因此，本文把视频当作讲解线索，把公式、术语和实验结论以 Stanford 官方讲义为准；代码部分则以本地 Assignment 1 的实现和测试为准。
+补充一个来源说明：我在登录 Bilibili 后确认该页面提供“中文 AI”字幕，但播放器没有暴露可复制的完整字幕稿。本次又使用本地保存的 ASR 转录（`txt`、`srt` 和带词级时间戳的 `json`）对照视频内容。因此，本文把视频和转录当作讲解线索，把公式、术语和实验结论以 Stanford 官方讲义为准；代码部分则以本地 Assignment 1 的实现和测试为准。
+
+## 0. 先按时间线看视频
+
+下面的时间是根据本地转录的片段起点整理的，适合边看视频边跳转；它不是把转录逐句复制到博客，而是把视频主线压缩成可复习的索引。
+
+| 视频位置 | 主题 | 阅读重点 |
+| --- | --- | --- |
+| 00:00 | 课程问题与作业模型 | 从 vanilla Transformer 过渡到现代架构，并对应 Assignment 1 要求实现的组件 |
+| 07:00 | Pre-Norm / Post-Norm | 残差流是否保持“干净”，以及梯度为何更容易穿过 Pre-Norm |
+| 11:30 | RMSNorm 与系统代价 | 去掉均值中心化后，表达能力、内存访问和 kernel 效率如何权衡 |
+| 22:50 | 串行层、并行层与门控 MLP | 注意力和 MLP 是否串行执行，以及 GLU/SwiGLU 为什么成为主流 |
+| 27:00 | RoPE | 用二维旋转把绝对位置变成 QK 点积中的相对位置信息 |
+| 36:40 | `d_ff`、宽深比和 head dim | `4D`、GLU 的约 `8D/3` 修正，以及 FLOPs、硬件利用率和模型形状的折中 |
+| 46:00 | 词表、tokenizer 与正则化 | 多语言模型为何倾向更大词表，以及大规模 LM 中 dropout/weight decay 的不同角色 |
+| 55:20 | Softmax 稳定性与 QK-Norm | z-loss、QK-Norm、logit soft-capping 分别控制哪一类数值风险 |
+| 62:00 | KV Cache、MQA/GQA 与滑动窗口 | 推理时显存带宽为何成为瓶颈，以及减少 KV head 如何降低缓存成本 |
 
 这不是一篇“现代模型都这么做，所以照抄就行”的配置清单。更重要的问题是：
 
