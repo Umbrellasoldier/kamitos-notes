@@ -16,6 +16,8 @@ draft: false
 
 这篇文章整理 Stanford CS336 第三讲 **Everything You Didn't Want to Know About LM Architecture and Hyperparameters**。我同时参考了[第三讲视频（第 3 集）](https://www.bilibili.com/video/BV11LEA6eEuj/?p=3)和 Stanford 官方的 [lecture_03.pdf](https://github.com/stanford-cs336/lectures/blob/main/lecture_03.pdf)。视频负责把问题讲得直观，讲义负责给出模型家族、实验观察和公式；下面再把它们和我在 Assignment 1 中真正写出的代码接起来。
 
+补充一个来源说明：我在登录 Bilibili 后确认该页面提供“中文 AI”字幕，但播放器没有暴露可复制的完整字幕稿。因此，本文把视频当作讲解线索，把公式、术语和实验结论以 Stanford 官方讲义为准；代码部分则以本地 Assignment 1 的实现和测试为准。
+
 这不是一篇“现代模型都这么做，所以照抄就行”的配置清单。更重要的问题是：
 
 - 一个 Transformer block 为什么会从 post-norm 变成 pre-norm；
@@ -471,4 +473,3 @@ K/V: [B, Hkv, T, d_h], Hkv < Hq
 - [Shazeer, GLU Variants Improve Transformer](https://arxiv.org/abs/2002.05202)
 
 如果你还没读前面的实现文章，可以按这个顺序继续：[Tokenizer 与 BPE](/posts/cs336-train-bpe-performance) → [Transformer 从零实现](/posts/cs336-transformer-from-scratch) → [训练数学](/posts/cs336-loss-adamw-schedule) → [训练循环与 checkpoint](/posts/cs336-training-loop-checkpoint) → [文本生成实验](/posts/cs336-generation-and-experiments)。
-
