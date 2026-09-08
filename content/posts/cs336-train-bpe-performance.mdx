@@ -2,7 +2,7 @@
 title: "CS336 train_bpe 实战：从正确实现到 3.5 倍性能优化"
 description: "复盘我实现 byte-level BPE 训练器的过程：预分词、增量 pair 统计、多进程分块、性能分析，以及一个被反复扫描的零计数集合如何成为真正瓶颈。"
 publishedAt: "2026-08-18"
-updatedAt: "2026-08-29"
+updatedAt: "2026-09-08"
 category: "技术"
 tags:
   - "CS336"
@@ -710,6 +710,56 @@ def decode(self, ids: list[int]) -> str:
 
 `errors="replace"` 让任意 ID 序列都有定义良好的输出；对合法文本的 `encode -> decode` 往返，不会产生替换字符。
 
+### Unicode、编码与 NUL：三个容易混淆的层次
+
+Python 的 `str` 表示 Unicode 字符序列，`bytes` 表示原始字节序列，token ID 则只是词表索引。这三层不能混用。
+
+例如 NUL 字符：
+
+```python
+nul = "\x00"
+
+print(repr(nul))  # '\x00'
+print(ord(nul))   # 0
+print(len(nul))   # 1
+```
+
+终端打印 `A\x00B` 时，中间通常看不见，但它仍然存在：
+
+```python
+text = "A\x00B"
+
+assert len(text) == 3
+assert text.index("\x00") == 1
+assert text.encode("utf-8") == b"A\x00B"
+```
+
+“打印不出来”不等于“字符串中没有”。调试控制字符要使用 `repr()`、`len()`、`ord()` 和 `.encode()`，不能只相信终端视觉结果。
+
+不同编码也会产生完全不同的字节长度：
+
+| 文本 | UTF-8 | UTF-16-LE | UTF-32-LE |
+| --- | ---: | ---: | ---: |
+| `hello` | 5 bytes | 10 bytes | 20 bytes |
+| `你好` | 6 bytes | 4 bytes | 8 bytes |
+| `🙃` | 4 bytes | 4 bytes | 4 bytes |
+
+Byte-level BPE 使用的是 UTF-8 bytes，不是“一个 Unicode 字符一个 token”。中文字符通常由 3 个 UTF-8 bytes 组成，emoji 常由 4 个或更多 bytes 组成；训练出的 merge 才可能把这些字节重新组合成更长 token。
+
+最重要的不变量是：**不要逐 token 做 UTF-8 解码。** `é` 的 UTF-8 bytes 为：
+
+```python
+b"\xc3\xa9"
+```
+
+若两个 BPE token 恰好分别存 `b"\xc3"` 和 `b"\xa9"`，单独解码任何一个都不完整；先拼接才会得到合法的 `é`。类似地，`b"\xc3("` 是真正的无效 UTF-8，因为 `0xc3` 后面缺少合法 continuation byte。二者的区别是：前者只是被 token 边界暂时切开，后者拼接后仍然非法。
+
+### 特殊 token 与普通文本为什么必须分两条路径
+
+特殊 token 是 tokenizer 协议的一部分，而不是一个“碰巧长得特殊”的普通字符串。训练时它阻止 pair 跨文档边界；编码时它必须整体映射成指定 ID；解码时它再按词表 bytes 还原。
+
+因此通用实现不能把 `<|endoftext|>` 写死在 `pretokenize_file` 内。函数应该接收 `special_tokens`，按长度降序构造转义后的模式，并让调用方决定哪些特殊 token 生效。这样 TinyStories 使用一个边界 token，未来有多个特殊 token 时仍然保持同一接口。
+
 ### 压缩率与吞吐量分别回答什么
 
 压缩率使用 bytes/token：
@@ -906,4 +956,4 @@ $$
 
 这次 BPE trainer 的实现让我第一次真正体会到 CS336 所强调的效率视角：算法正确只是起点；测量资源、维护状态不变量，并用实验区分直觉和事实，才是“从头构建”最值得学习的部分。
 
-完成 token IDs 后，下一站就是把 `[batch, sequence]` 的整数输入变成 `[batch, sequence, vocab]` 的 next-token logits。完整实现见[《CS336 Transformer 从零实现：从张量形状到完整语言模型》](/posts/cs336-transformer-from-scratch)。
+完成 token IDs 后，下一站就是把 `[batch, sequence]` 的整数输入变成 `[batch, sequence, vocab]` 的 next-token logits。完整实现见[《CS336 Transformer 从零实现：从张量形状到完整语言模型》](/posts/cs336-transformer-from-scratch)。之后依次是[训练数学](/posts/cs336-loss-adamw-schedule)、[训练循环与 checkpoint](/posts/cs336-training-loop-checkpoint)，以及[生成与实验分析](/posts/cs336-generation-and-experiments)。

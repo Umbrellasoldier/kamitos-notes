@@ -1,0 +1,517 @@
+---
+title: "CS336 训练循环：从 memmap Batch 到 Checkpoint 与可恢复实验"
+description: "把 tokenized 二进制语料、随机 next-token batch、训练与验证模式、梯度更新、JSONL 日志和 checkpoint 串成一条可恢复、可测量的 Transformer 训练流水线。"
+publishedAt: "2026-09-08"
+category: "技术"
+tags:
+  - "CS336"
+  - "Training Loop"
+  - "Checkpoint"
+  - "PyTorch"
+  - "MPS"
+featured: false
+draft: false
+---
+
+完成 Transformer 前向、cross entropy 和 AdamW 后，剩下的任务看起来只是“写一个 for 循环”。实际上，训练循环是所有状态汇合的位置：数据位置、模型参数、优化器动量、学习率、随机数、日志时间和 checkpoint step 都必须保持一致。
+
+这一篇按我的实际实现，连接以下链路：
+
+```text
+uint16 token 文件
+  -> np.memmap
+  -> 随机连续窗口 (x, y)
+  -> Transformer logits
+  -> cross entropy
+  -> backward
+  -> gradient clipping
+  -> AdamW step
+  -> validation / JSONL / checkpoint
+```
+
+关于模型内部结构见[《CS336 Transformer 从零实现》](/posts/cs336-transformer-from-scratch)，关于 loss 和优化器公式见[《CS336 训练数学》](/posts/cs336-loss-adamw-schedule)。
+
+## 1. 为什么训练数据保存为一条 token ID 流
+
+tokenizer 已经把文本编码为小端 `uint16`：
+
+```python
+dataset = np.memmap(
+    path,
+    dtype="<u2",
+    mode="r",
+)
+```
+
+`memmap` 不会把整个数 GB 文件一次读进内存。它把文件映射成类似 NumPy 数组的视图，真正访问某段时由操作系统按页读取。
+
+对 next-token language modeling，只需要连续 token 流即可：给定起点 $s$ 和上下文长度 $T$：
+
+$$
+x=\text{tokens}[s:s+T],
+$$
+
+$$
+y=\text{tokens}[s+1:s+T+1].
+$$
+
+同一份数据只错开一位。`x[t]` 的监督目标就是 `y[t]`。
+
+## 2. `get_batch` 的完整形状
+
+我的实现是：
+
+```python
+def get_batch(
+    dataset,
+    batch_size,
+    context_length,
+    device,
+):
+    starts = np.random.randint(
+        0,
+        len(dataset) - context_length,
+        size=batch_size,
+    )
+
+    x_rows = [
+        dataset[start : start + context_length]
+        for start in starts
+    ]
+    y_rows = [
+        dataset[start + 1 : start + context_length + 1]
+        for start in starts
+    ]
+
+    x = np.stack(x_rows)
+    y = np.stack(y_rows)
+
+    x = torch.tensor(x, dtype=torch.long, device=device)
+    y = torch.tensor(y, dtype=torch.long, device=device)
+    return x, y
+```
+
+形状为：
+
+```text
+starts: [B]
+x:      [B, T]
+y:      [B, T]
+```
+
+虽然文件存的是 `uint16`，embedding 索引需要整数 ID 张量，因此送入模型前转成 `torch.long`。
+
+### 起点上界为什么是 `len(dataset) - context_length`
+
+NumPy `randint(low, high)` 的 `high` 不会被采到。最大可能起点是：
+
+$$
+s_{max}=N-T-1.
+$$
+
+目标切片的末尾是 `s + T + 1`，Python 切片右端不包含，因此刚好能取到索引 $N-1$，不会越界。
+
+如果数据长度不大于 context length，当前实现无法采样；正式脚本应在加载后尽早给出清晰错误。
+
+## 3. 一次 `train_step` 中发生了什么
+
+```python
+def train_step(
+    model,
+    optimizer,
+    inputs,
+    targets,
+    max_grad_norm,
+):
+    model.train()
+    optimizer.zero_grad()
+
+    logits = model(inputs)
+    loss = cross_entropy(
+        logits.reshape(-1, logits.shape[-1]),
+        targets.reshape(-1),
+    )
+
+    loss.backward()
+    gradient_clipping(
+        model.parameters(),
+        max_grad_norm,
+    )
+    optimizer.step()
+
+    return loss.detach()
+```
+
+把它展开，可以看到三种完全不同的状态：
+
+1. **模型状态**：参数张量和 module 的 train/eval 模式；
+2. **autograd 状态**：本轮前向计算图与各参数 `.grad`；
+3. **优化器状态**：AdamW 的 step、`m`、`v`。
+
+`loss.detach()` 返回一个不再连接计算图的张量，适合记录日志。若长期把带图的 loss 保存进列表，会让旧计算图无法释放，内存不断增长。
+
+### 为什么 `optimizer.zero_grad()` 必须在前面
+
+PyTorch 默认把新梯度累加到已有 `.grad`。这支持 gradient accumulation，但普通一步一更新的训练必须先清空。否则第 2 步使用的是第 1、2 步梯度之和，第 3 步又是前三步之和，实验很快偏离预期。
+
+## 4. 验证为什么需要 `eval()` 和 `no_grad()`
+
+```python
+@torch.no_grad()
+def evaluate(
+    model,
+    dataset,
+    eval_batches,
+    batch_size,
+    context_length,
+    device,
+):
+    model.eval()
+    losses = []
+
+    for _ in range(eval_batches):
+        inputs, targets = get_batch(
+            dataset,
+            batch_size,
+            context_length,
+            device,
+        )
+        logits = model(inputs)
+        loss = cross_entropy(
+            logits.reshape(-1, logits.shape[-1]),
+            targets.reshape(-1),
+        )
+        losses.append(loss)
+
+    return torch.stack(losses).mean().item()
+```
+
+两者解决不同问题：
+
+- `model.eval()` 切换 module 行为。若存在 dropout 或 batch normalization，它们的行为会改变；
+- `torch.no_grad()` 关闭梯度记录，减少验证的计算图与内存开销。
+
+即使当前模型没有 dropout，也应该保留两者，让训练循环的语义完整，并避免未来改模型时验证悄悄出错。
+
+验证结束后，下一次 `train_step` 会再次调用 `model.train()`。不能只在程序开头调用一次，因为 `evaluate()` 已把模式改成 eval。
+
+### 验证 loss 是估计值，不是神谕
+
+当前验证从 memmap 中随机采 `eval_batches` 个 batch，因此每次评估使用的窗口可能不同。增大 `eval_batches` 会降低估计方差，但消耗更多时间。
+
+更严格的可比实验有两种做法：
+
+1. 为验证采样器使用单独且固定的随机数生成器；
+2. 预先生成固定起点，并在所有实验中复用。
+
+否则两个学习率实验之间的小差异可能来自验证抽样，而不完全来自模型。
+
+## 5. 学习率必须在 `optimizer.step()` 前写入
+
+每一步先计算调度值，再更新所有 parameter group：
+
+```python
+learning_rate = get_lr_cosine_schedule(
+    it=step,
+    max_learning_rate=args.max_learning_rate,
+    min_learning_rate=args.min_learning_rate,
+    warmup_iters=args.warmup_iters,
+    cosine_cycle_iters=args.num_steps,
+)
+
+for group in optimizer.param_groups:
+    group["lr"] = learning_rate
+```
+
+然后本轮 `optimizer.step()` 才会使用这个值。若日志先打印 step、更新却使用另一个 step 的学习率，曲线看起来会错一位。最简单的原则是：**日志记录的 learning rate 必须就是本次参数更新实际读取的值。**
+
+## 6. Checkpoint 必须保存模型之外的状态
+
+只保存 `model.state_dict()` 可以做推理，却不能无缝继续训练。AdamW 的 `m`、`v` 和 step 会丢失，相当于优化器突然失忆。
+
+我的 checkpoint 结构是：
+
+```python
+def save_checkpoint(model, optimizer, iteration, out):
+    checkpoint = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "iteration": iteration,
+    }
+    torch.save(checkpoint, out)
+```
+
+恢复时：
+
+```python
+def load_checkpoint(src, model, optimizer):
+    checkpoint = torch.load(src)
+
+    model.load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+
+    return checkpoint["iteration"]
+```
+
+三项分别回答：
+
+| 字段 | 恢复的状态 |
+| --- | --- |
+| `model` | Transformer 全部参数和 buffer |
+| `optimizer` | parameter groups、AdamW 的 step、`m`、`v` |
+| `iteration` | 训练循环应该从哪里继续 |
+
+### `iteration` 到底表示“已完成”还是“下一步”
+
+必须选一种语义并贯彻到底。最不容易错的做法是把 checkpoint 中的 iteration 定义为“下一次要执行的 step”。
+
+例如完成 step 59 后保存：
+
+```python
+save_checkpoint(
+    model,
+    optimizer,
+    iteration=60,
+    out=path,
+)
+```
+
+恢复日志就会显示：
+
+```text
+resumed from step=60
+```
+
+循环从 60 开始，不重复第 59 步，也不跳过第 60 步。之前的断点续训实验证明，从 step 60 恢复后能继续输出 step 60、80、100。
+
+### 还没有保存哪些状态
+
+当前最小 checkpoint 没有保存：
+
+- Python、NumPy、PyTorch 的随机数状态；
+- MPS/CUDA 的随机数状态；
+- 已用墙钟时间；
+- 完整命令行配置；
+- 日志文件偏移。
+
+所以它恢复的是模型与优化器训练进度，不保证中断前后逐 token、逐 batch 位级一致。若追求完全可复现，应额外保存 RNG state 和配置，并确认数据采样顺序。
+
+## 7. Resume 为什么必须验证配置一致
+
+恢复前，模型结构必须能加载旧 state dict。以下参数尤其不能随意改变：
+
+```text
+vocab_size
+context_length（若它影响持久 buffer）
+d_model
+num_layers
+num_heads
+d_ff
+```
+
+batch size 通常可以改变，因为它不改变参数形状，但它会改变每一步处理的 token 数和优化轨迹。学习率调度总步数改变后，也要明确你是在延长原曲线，还是重新定义曲线。
+
+建议 checkpoint 同时保存配置：
+
+```python
+checkpoint = {
+    "model": model.state_dict(),
+    "optimizer": optimizer.state_dict(),
+    "iteration": next_step,
+    "config": vars(args),
+}
+```
+
+恢复时先比较关键字段，再加载权重。这样错误会在训练开始前被解释清楚，而不是变成难读的 shape mismatch。
+
+## 8. 怎样计算 tokens 与 throughput
+
+每次更新处理的训练 token 数是：
+
+$$
+N_{step}=B\times T.
+$$
+
+完成 $s$ 次更新后：
+
+$$
+N_{tokens}=sBT.
+$$
+
+例如正式训练：
+
+```text
+batch_size     = 32
+context_length = 256
+num_steps      = 5000
+```
+
+因此：
+
+$$
+5000\times32\times256
+=40{,}960{,}000\text{ tokens}.
+$$
+
+session throughput 是：
+
+$$
+\text{throughput}
+=\frac{\text{training tokens processed}}
+{\text{session wall-clock seconds}}.
+$$
+
+如果分母包含 validation 和 checkpoint 时间，而分子只计训练 token，那么它是**端到端实验吞吐量**。它适合估算整场训练耗时，但不能等同于纯 forward/backward kernel 吞吐量。
+
+我的正式运行最终为：
+
+```text
+tokens       = 40,960,000
+session_time = 6,939.81 s
+throughput   = 5,902 token/s
+```
+
+反算得到：
+
+$$
+40{,}960{,}000/6{,}939.81\approx5{,}902.
+$$
+
+## 9. 为什么日志使用 JSONL
+
+JSONL 是“一行一个 JSON 对象”：
+
+```json
+{"step": 100, "train_loss": 3.61, "validation_loss": 3.40, "lr": 0.000595}
+{"step": 150, "train_loss": 3.29, "validation_loss": 3.18, "lr": 0.000251}
+```
+
+它比一个大 JSON 数组更适合长训练：
+
+- 每次评估后追加一行，不必重写整个文件；
+- 中途停止时，之前的完整行仍然可读；
+- 可以流式处理；
+- 每一行都能独立 `json.loads`。
+
+最小写法：
+
+```python
+record = {
+    "step": step,
+    "tokens": tokens_seen,
+    "lr": learning_rate,
+    "train_loss": train_loss,
+    "validation_loss": validation_loss,
+    "session_time": elapsed,
+    "throughput": tokens_seen / elapsed,
+}
+
+with log_path.open("a", encoding="utf-8") as file:
+    file.write(json.dumps(record) + "\n")
+```
+
+绘图时逐行读取：
+
+```python
+records = []
+
+with log_path.open(encoding="utf-8") as file:
+    for line in file:
+        records.append(json.loads(line))
+
+steps = [record["step"] for record in records]
+validation_losses = [
+    record["validation_loss"]
+    for record in records
+]
+```
+
+JSON 中的 key 必须使用双引号；Python 读入后得到普通 dict。
+
+## 10. MPS 内存数字应该怎样读
+
+日志中我同时记录：
+
+```text
+mps_allocated
+mps_driver
+```
+
+`allocated` 更接近当前由 PyTorch 张量占用的 MPS 内存；`driver` 还包含 MPS 后端和缓存保留的内存。driver 较大不等于发生泄漏，缓存会为了后续复用而保留。
+
+实验中 batch 增大时 driver footprint 从约 2.09 GiB 上升到 5.10 GiB，而稳定训练时 allocated 约 0.88 GiB。判断泄漏应看同一配置、相同步骤下 allocated 是否持续无界增长，而不是只看 driver 的高水位。
+
+## 11. 我的正式 TinyStories 配置与结果
+
+```text
+vocab_size        = 10000
+context_length    = 256
+d_model           = 512
+num_layers        = 4
+num_heads         = 16
+d_ff              = 1344
+batch_size        = 32
+num_steps         = 5000
+max_lr            = 0.002
+min_lr            = 0.0002
+warmup_iters       = 250
+device             = MPS
+```
+
+最终结果：
+
+| 指标 | 数值 |
+| --- | ---: |
+| 训练 tokens | 40,960,000 |
+| 最终 train loss | 1.713043 |
+| 最终 validation loss | 1.708244 |
+| validation perplexity | 约 5.52 |
+| session time | 6,939.81 秒，约 1 小时 56 分 |
+| 端到端吞吐量 | 5,902 token/s |
+
+对应产物：
+
+```text
+artifacts/checkpoints/tinystories_17m_lr2e-3_5k.pt
+artifacts/logs/tinystories_17m_lr2e-3_5k.jsonl
+artifacts/plots/tinystories_17m_lr2e-3_5k.png
+```
+
+文件名中的 `17m` 是模型配置标签，不是本次处理 token 数；真实训练 token 数应从 $steps\times batch\times context$ 计算，或直接读取日志。
+
+## 12. 训练循环最常见的假成功
+
+### 在同一个固定 batch 上 loss 快速归零
+
+这只能证明模型、loss、backward 和 optimizer 能共同拟合一个小样本，是 smoke test。它不能证明模型学到了可泛化的语言规律。必须再看新随机 batch 和独立 validation 数据。
+
+### checkpoint 能保存但不能恢复
+
+只测试文件存在不够。应启动一个短运行、保存、创建全新 model/optimizer、加载并继续至少一步，确认 iteration 与 optimizer state 都恢复。
+
+### 命令行参数存在但没有真正接线
+
+argparse 能打印参数，不代表内部使用了它。应该用极小配置改变 `batch_size`、`context_length`、模型宽度、评估间隔和 checkpoint 间隔，再从 token 计数、shape 或输出时间点验证每个参数确实生效。
+
+### 日志漂亮但含义混乱
+
+明确区分：
+
+- `step` 是已完成更新还是即将执行的更新；
+- `train_loss` 是当前 batch、区间平均还是固定评估集；
+- `time` 是本 session 还是包含 resume 前历史；
+- `throughput` 是否包含 validation/checkpoint 开销。
+
+## 13. 最小端到端验证顺序
+
+1. 用很小模型在 CPU/MPS 上完成 1 步，确认 loss 有限；
+2. 固定一个 batch 训练几十步，确认可以过拟合；
+3. 换成新随机 batch 与 validation，确认不是只记忆一个 batch；
+4. 修改 CLI 中的模型、batch、优化器参数，确认接线；
+5. 保存 checkpoint，用新进程恢复并继续；
+6. 检查 JSONL 每一行都能解析；
+7. 再启动正式长运行。
+
+这个顺序把“数学是否正确”“程序是否接通”“实验是否可信”分开验证。正式运行失败时，才知道应该从哪一层排查。
+
+下一篇[《CS336 文本生成与实验分析》](/posts/cs336-generation-and-experiments)会从 checkpoint 加载模型，解释 greedy、temperature、top-p、EOS、固定 seed 和上下文截断，并复盘我的学习率实验与最终生成结果。

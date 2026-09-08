@@ -1,0 +1,508 @@
+---
+title: "CS336 训练数学：从 Cross Entropy 到 AdamW、Warmup 与梯度裁剪"
+description: "从 next-token prediction 的训练目标出发，推导稳定交叉熵、困惑度、AdamW、余弦学习率与全局梯度裁剪，并逐行对应我的 CS336 实现。"
+publishedAt: "2026-09-08"
+category: "技术"
+tags:
+  - "CS336"
+  - "Cross Entropy"
+  - "AdamW"
+  - "PyTorch"
+  - "深度学习"
+featured: false
+draft: false
+---
+
+上一篇[《CS336 Transformer 从零实现》](/posts/cs336-transformer-from-scratch)停在了 `[B,T,V]` logits。模型已经能为每个位置、每个词表项给出分数，但它还不知道什么答案是对的，也不知道怎样修改参数。
+
+这一篇只回答训练数学中的五个问题：
+
+1. next-token prediction 的标签从哪里来；
+2. cross entropy 为什么可以直接接 logits；
+3. AdamW 为什么要保存一阶、二阶动量；
+4. warmup 与 cosine decay 在控制什么；
+5. gradient clipping 为什么是在保护整个训练状态，而不只是某一层。
+
+文中的核心代码对应我仓库里的 `cs336_basics/optimizer.py` 和训练脚本。重点不是背公式，而是让每个公式都能落到一个张量、一段状态和一次参数更新上。
+
+## 1. 训练样本其实是一条序列错开一位
+
+假设 tokenizer 产生：
+
+```text
+[12, 81, 6, 29, 4]
+```
+
+训练输入与标签是：
+
+```text
+x = [12, 81, 6, 29]
+y = [81,  6, 29, 4]
+```
+
+模型看到 `x[:, :t+1]`，在位置 `t` 预测 `y[:, t]`。对于 batch size 为 $B$、上下文长度为 $T$、词表大小为 $V$ 的 batch：
+
+```text
+x:      [B, T]
+y:      [B, T]
+logits: [B, T, V]
+```
+
+一个 batch 不是只有 $B$ 个监督信号，而是有 $B\times T$ 个 next-token 分类问题。因果 mask 保证第 $t$ 个位置不能从未来 token 偷看答案，因此这些位置可以在一次前向传播中并行训练。
+
+这就是 teacher forcing：训练时整段正确文本已经存在，我们同时构造所有位置的输入；生成时未来 token 不存在，只能一次生成一个。因此训练能沿序列维并行，生成通常不能。
+
+## 2. Logits 不是概率
+
+模型最后输出的 logits 是任意实数：
+
+```text
+[2.4, -0.7, 1.1, ...]
+```
+
+它们不要求非负，和也不等于 1。softmax 才把一组 logits $z_1,\ldots,z_V$ 转成概率：
+
+$$
+p_i=\frac{\exp(z_i)}{\sum_{j=1}^{V}\exp(z_j)}.
+$$
+
+如果目标 token 的 ID 是 $y$，单个位置的 negative log-likelihood 是：
+
+$$
+\ell=-\log p_y.
+$$
+
+代入 softmax：
+
+$$
+\ell
+=-z_y+\log\left(\sum_{j=1}^{V}\exp(z_j)\right).
+$$
+
+因此 cross entropy 可以理解为两部分：
+
+- `log_normalizer`：所有类别共同竞争形成的归一化项；
+- `target_logits`：正确类别的原始分数。
+
+$$
+\ell=\operatorname{logsumexp}(z)-z_y.
+$$
+
+正确 token 的 logit 越大，loss 越小；其他 token 的 logits 越大，归一化项越大，loss 越大。
+
+## 3. 为什么不能直接计算 `log(sum(exp(logits)))`
+
+若某个 logit 是 1000，`exp(1000)` 会溢出。利用对所有 logits 同时减去最大值不改变 softmax 的性质，令
+
+$$
+m=\max_j z_j,
+$$
+
+则：
+
+$$
+\operatorname{logsumexp}(z)
+=m+\log\left(\sum_j \exp(z_j-m)\right).
+$$
+
+此时每个 $z_j-m\le 0$，最大的指数是 1，不会出现巨大的中间值。
+
+我的稳定 cross entropy 可以写成：
+
+```python
+def cross_entropy(logits, targets):
+    max_logits = logits.max(dim=-1, keepdim=True).values
+    shifted = logits - max_logits
+
+    log_normalizer = (
+        torch.log(torch.exp(shifted).sum(dim=-1))
+        + max_logits.squeeze(-1)
+    )
+
+    target_logits = logits.gather(
+        dim=-1,
+        index=targets.unsqueeze(-1),
+    ).squeeze(-1)
+
+    return (log_normalizer - target_logits).mean()
+```
+
+这里 `gather` 不是在做 argmax，而是在每一行拿出目标 ID 对应的那个 logit。形状变化是：
+
+```text
+logits:                 [..., V]
+targets:                [...]
+targets.unsqueeze(-1):  [..., 1]
+gather result:          [..., 1]
+squeeze result:         [...]
+```
+
+训练脚本把前两维摊平：
+
+```python
+loss = cross_entropy(
+    logits.reshape(-1, logits.shape[-1]),
+    targets.reshape(-1),
+)
+```
+
+于是 `[B,T,V]` 变成 `[B*T,V]`，`[B,T]` 变成 `[B*T]`。这不会改变样本内容，只是把所有 token 位置当作同一种分类样本交给 loss。
+
+### 为什么对 token loss 取平均
+
+若使用总和，batch 越大、序列越长，梯度绝对值就越大，学习率也不得不随 token 数变化。取平均后，loss 的尺度大致不依赖 $B\times T$，更便于比较实验和复用学习率。
+
+## 4. Perplexity 是 cross entropy 的指数
+
+若验证集平均 cross entropy 为 $L$，困惑度定义为：
+
+$$
+\operatorname{PPL}=\exp(L).
+$$
+
+直觉上，它可以近似理解为模型平均还在多少个同等可能的候选之间犹豫。这个解释不是严格的类别计数，但能帮助理解量级。
+
+我的正式 TinyStories 训练最后得到：
+
+```text
+validation_loss = 1.708244
+```
+
+因此：
+
+$$
+\operatorname{PPL}=\exp(1.708244)\approx5.52.
+$$
+
+注意：只有在 tokenization、数据集和 loss 聚合方式一致时，perplexity 才能直接比较。不同 tokenizer 的“一个 token”含义不同，PPL 不能脱离这些条件排名。
+
+## 5. 从梯度下降到 AdamW
+
+最基本的 SGD 更新是：
+
+$$
+\theta_t=\theta_{t-1}-\alpha g_t,
+$$
+
+其中 $\theta$ 是参数，$g_t=\nabla_\theta L_t$ 是当前梯度，$\alpha$ 是学习率。
+
+SGD 只看当前梯度。AdamW 额外保存两个与参数同形状的状态：
+
+- 一阶动量 $m_t$：梯度的指数移动平均，描述稳定方向；
+- 二阶动量 $v_t$：梯度平方的指数移动平均，描述每个坐标的典型尺度。
+
+更新为：
+
+$$
+m_t=\beta_1m_{t-1}+(1-\beta_1)g_t,
+$$
+
+$$
+v_t=\beta_2v_{t-1}+(1-\beta_2)g_t^2.
+$$
+
+通常 $\beta_1=0.9$，$\beta_2=0.999$。一阶动量响应较快，二阶动量看更长时间尺度。
+
+### 5.1 为什么需要 bias correction
+
+$m_0$ 和 $v_0$ 初始化为 0，所以训练早期的移动平均会天然偏向 0。修正后：
+
+$$
+\hat m_t=\frac{m_t}{1-\beta_1^t},
+\qquad
+\hat v_t=\frac{v_t}{1-\beta_2^t}.
+$$
+
+Adam 的自适应更新为：
+
+$$
+\theta_t
+=\theta_{t-1}
+-\alpha\frac{\hat m_t}{\sqrt{\hat v_t}+\epsilon}.
+$$
+
+二阶动量大的坐标通常得到更小的有效步长；二阶动量小的坐标得到更大的有效步长。
+
+我的实现没有显式创建 `m_hat` 和 `v_hat`，而是把 bias correction 合并进学习率：
+
+```python
+adjusted_lr = (
+    lr
+    * math.sqrt(1 - beta2 ** step)
+    / (1 - beta1 ** step)
+)
+
+parameter.addcdiv_(
+    m,
+    v.sqrt().add_(eps),
+    value=-adjusted_lr,
+)
+```
+
+这与使用 $\hat m_t$、$\hat v_t$ 的公式等价，只是代数排列不同。
+
+### 5.2 AdamW 的 W 到底是什么
+
+AdamW 在自适应梯度更新之外，单独做 weight decay：
+
+$$
+\theta\leftarrow(1-\alpha\lambda)\theta.
+$$
+
+对应代码：
+
+```python
+parameter.mul_(1 - lr * weight_decay)
+```
+
+它是 decoupled weight decay：参数收缩与梯度的自适应缩放分开。若只是把 $\lambda\theta$ 加进梯度，Adam 的二阶动量还会重新缩放这项正则化，行为不再等同于直接的权重衰减。
+
+### 5.3 完整状态更新如何对应代码
+
+```python
+state = self.state[parameter]
+
+if len(state) == 0:
+    state["step"] = 0
+    state["m"] = torch.zeros_like(parameter)
+    state["v"] = torch.zeros_like(parameter)
+
+state["step"] += 1
+m = state["m"]
+v = state["v"]
+
+parameter.mul_(1 - lr * weight_decay)
+
+m.mul_(beta1).add_(gradient, alpha=1 - beta1)
+v.mul_(beta2).addcmul_(
+    gradient,
+    gradient,
+    value=1 - beta2,
+)
+
+adjusted_lr = (
+    lr
+    * math.sqrt(1 - beta2 ** state["step"])
+    / (1 - beta1 ** state["step"])
+)
+
+parameter.addcdiv_(
+    m,
+    v.sqrt().add_(eps),
+    value=-adjusted_lr,
+)
+```
+
+`@torch.no_grad()` 很重要：优化器正在原地修改参数，这个更新本身不应该被 autograd 记录为下一张计算图。反向传播负责产生 `parameter.grad`；优化器负责使用这些梯度修改长期状态。
+
+## 6. Warmup 与 cosine decay
+
+固定学习率很难同时满足两个阶段：
+
+- 刚开始时参数和动量状态尚未稳定，过大的步长容易破坏训练；
+- 中后期需要较小步长进行精细收敛。
+
+因此我使用 linear warmup 加 cosine decay。
+
+在 warmup 阶段 $0\le t<T_w$：
+
+$$
+\alpha_t=\alpha_{max}\frac{t}{T_w}.
+$$
+
+在余弦退火阶段 $T_w\le t\le T_c$，先定义进度：
+
+$$
+r=\frac{t-T_w}{T_c-T_w},
+$$
+
+再定义权重：
+
+$$
+w=\frac{1+\cos(\pi r)}{2},
+$$
+
+最终学习率：
+
+$$
+\alpha_t
+=\alpha_{min}
++w(\alpha_{max}-\alpha_{min}).
+$$
+
+超过 $T_c$ 后固定为 $\alpha_{min}$。
+
+对应实现：
+
+```python
+def get_lr_cosine_schedule(
+    it,
+    max_learning_rate,
+    min_learning_rate,
+    warmup_iters,
+    cosine_cycle_iters,
+):
+    if it < warmup_iters:
+        return max_learning_rate * it / warmup_iters
+
+    if it <= cosine_cycle_iters:
+        progress = (
+            (it - warmup_iters)
+            / (cosine_cycle_iters - warmup_iters)
+        )
+        weight = 0.5 * (1 + math.cos(math.pi * progress))
+        return (
+            min_learning_rate
+            + weight
+            * (max_learning_rate - min_learning_rate)
+        )
+
+    return min_learning_rate
+```
+
+三个边界值应该手工检查：
+
+```text
+t = 0      -> 0
+t = T_w    -> max_learning_rate
+t = T_c    -> min_learning_rate
+```
+
+当前版本假设 `warmup_iters > 0` 且 `cosine_cycle_iters > warmup_iters`。若以后要支持零 warmup，需要额外处理除零边界。
+
+### 为什么日志中的 step 0 学习率是 0
+
+因为调度公式在 $t=0$ 给出：
+
+$$
+\alpha_0=\alpha_{max}\frac{0}{T_w}=0.
+$$
+
+这不是优化器失效，而是 warmup 的定义。更值得确认的是“打印的 step、设置学习率的时机、执行 optimizer.step 的时机”是否使用同一套编号，否则日志会产生一位偏移。
+
+## 7. Gradient clipping 保护的是什么
+
+反向传播会为每个参数张量产生一个梯度。全局 L2 范数是把所有参数的梯度视为一个长向量：
+
+$$
+\lVert g\rVert_2
+=\sqrt{\sum_k\sum_i g_{k,i}^2}.
+$$
+
+若它超过阈值 $M$，统一乘以：
+
+$$
+s=\min\left(1,\frac{M}{\lVert g\rVert_2+\epsilon}\right).
+$$
+
+所以每个梯度方向之间的比例保持不变，只缩短整个更新向量：
+
+$$
+g_k\leftarrow s g_k.
+$$
+
+我的实现是：
+
+```python
+@torch.no_grad()
+def gradient_clipping(parameters, max_l2_norm):
+    gradients = [
+        parameter.grad
+        for parameter in parameters
+        if parameter.grad is not None
+    ]
+
+    if not gradients:
+        return
+
+    gradient_norms = torch.stack([
+        torch.linalg.vector_norm(gradient)
+        for gradient in gradients
+    ])
+    total_norm = torch.linalg.vector_norm(gradient_norms)
+
+    scale = torch.clamp(
+        max_l2_norm / (total_norm + 1e-6),
+        max=1.0,
+    )
+
+    for gradient in gradients:
+        gradient.mul_(scale)
+```
+
+它“保护前向和反向传播”的更准确说法是：裁剪发生在反向传播之后、参数更新之前，直接保护的是这次 optimizer update。避免一次异常 batch 产生巨大更新，又间接减少参数被推到极端区域后导致下一次前向溢出或下一次反向梯度爆炸的风险。
+
+为什么不是每层各自裁剪？因为每层独立截断会改变不同层之间的相对更新大小；全局裁剪保留整个梯度方向。
+
+## 8. 一次训练更新的严格顺序
+
+```python
+model.train()
+optimizer.zero_grad()
+
+logits = model(inputs)
+loss = cross_entropy(
+    logits.reshape(-1, logits.shape[-1]),
+    targets.reshape(-1),
+)
+
+loss.backward()
+gradient_clipping(model.parameters(), max_l2_norm=1.0)
+optimizer.step()
+```
+
+顺序不能随意交换：
+
+1. `zero_grad()` 清除上一次迭代留下的梯度；
+2. forward 构建计算图；
+3. loss 把每个位置的预测压成一个标量；
+4. backward 把梯度写入 `.grad`；
+5. clipping 使用完整的全局梯度；
+6. optimizer 更新参数与动量状态。
+
+如果先 `optimizer.step()` 再裁剪，裁剪就来不及了；如果忘记 `zero_grad()`，PyTorch 默认会累加梯度。梯度累加有时是有意的，但必须同时调整有效 batch size 和优化器更新频率。
+
+## 9. 经典问题
+
+### 为什么 model forward 不直接返回 softmax 概率
+
+因为稳定 cross entropy 需要在 logits 上做 log-sum-exp；提前 softmax 会丢失数值稳定性，还多一次不必要的计算。生成时才根据 temperature、top-p 等策略把 logits 转成概率。
+
+### 为什么训练 loss 抖动不代表训练失败
+
+每一步通常采样不同随机窗口，batch 难度不同。单个 batch loss 是噪声很大的估计；判断趋势要看移动平均或固定协议下的验证 loss。
+
+### 为什么 validation loss 比 train loss 更低也可能正常
+
+日志里的 `train_loss` 可能只是最近一个随机 batch，而 `validation_loss` 是多个 batch 的平均；两者估计方差不同。模型还可能处于 `eval()` 模式且验证样本恰好更容易。只有在采样、聚合和模式都一致时才适合逐点比较。
+
+### AdamW 为什么比参数本身占更多内存
+
+每个参数通常还要保存梯度、一阶动量和二阶动量。忽略临时激活时，FP32 参数训练常见的下限近似是参数、梯度、$m$、$v$ 四份状态，而不是只存一份权重。
+
+### 梯度裁剪能修复错误的学习率吗
+
+不能。裁剪是异常更新的保险丝，不应替代合理的学习率、初始化和数值稳定实现。如果几乎每一步都触发裁剪，应该检查学习率、数据、loss 缩放和模型结构。
+
+## 10. 最小验证清单
+
+完成这些组件后，我会至少检查：
+
+```python
+# cross entropy：平移 logits 不改变结果
+loss1 = cross_entropy(logits, targets)
+loss2 = cross_entropy(logits + 1000, targets)
+assert torch.allclose(loss1, loss2)
+
+# schedule：三个边界
+assert get_lr_cosine_schedule(0, ...) == 0
+assert get_lr_cosine_schedule(warmup_iters, ...) == max_lr
+assert get_lr_cosine_schedule(cosine_cycle_iters, ...) == min_lr
+
+# clipping：裁剪后全局范数不超过阈值
+gradient_clipping(model.parameters(), 1.0)
+```
+
+课程测试确认参考值，主动不变量检查则告诉我代码为什么正确。两者缺一不可。
+
+下一篇[《CS336 训练循环：从 memmap batch 到 checkpoint 与可恢复实验》](/posts/cs336-training-loop-checkpoint)会把这些数学组件装进真正的训练程序，并解释日志中的 step、tokens、throughput、train/validation loss 和断点续训分别代表什么。

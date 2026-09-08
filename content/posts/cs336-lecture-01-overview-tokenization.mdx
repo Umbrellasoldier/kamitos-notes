@@ -2,7 +2,7 @@
 title: "CS336 第一讲笔记：从课程全景到 BPE 分词"
 description: "梳理 Stanford CS336 第一讲的课程主线、效率视角与分词基础，并从字节出发推导 BPE 的训练过程。"
 publishedAt: "2026-08-13"
-updatedAt: "2026-08-15"
+updatedAt: "2026-09-08"
 category: "技术"
 tags:
   - "CS336"
@@ -192,8 +192,8 @@ $$
 语言模型不能直接接收字符串。Tokenizer 需要完成双向映射：
 
 $$
-\text{bytes} \xrightarrow{\operatorname{encode}} (t_1,t_2,\ldots,t_T)
-\xrightarrow{\operatorname{decode}} \text{bytes}.
+\text{bytes} \longrightarrow (t_1,t_2,\ldots,t_T)
+\longrightarrow \text{bytes}.
 $$
 
 最重要的正确性条件是往返不丢信息：
@@ -392,6 +392,14 @@ Tokenizer 决定一次注意力计算覆盖多少原始文本；数据管线决�
 BPE 也不是最终答案。直接建模字节可以消除独立分词步骤，但现有 Transformer 在长字节序列上仍不够高效。未来系统或许会学习动态、分层的文本块；在那之前，BPE 仍是一个简单、稳定而且非常难绕开的基线。
 
 第一讲到这里完成了课程地图和第一个基础部件。下一讲将进入 **resource accounting**：开始精确核算参数、激活、优化器状态、FLOPs 与硬件利用率。
+
+如果要沿着 Assignment 1 的代码继续，可以依次阅读：
+
+1. [BPE trainer、tokenizer 与二进制语料](/posts/cs336-train-bpe-performance)；
+2. [Transformer 前向结构](/posts/cs336-transformer-from-scratch)；
+3. [Cross entropy、AdamW 与学习率](/posts/cs336-loss-adamw-schedule)；
+4. [训练循环与 checkpoint](/posts/cs336-training-loop-checkpoint)；
+5. [文本生成与实验分析](/posts/cs336-generation-and-experiments)。
 
 ## 参考资料
 

@@ -1,0 +1,514 @@
+---
+title: "CS336 文本生成与实验分析：Greedy、Temperature、Top-p 与可复现性"
+description: "从训练好的 TinyStories checkpoint 出发，逐步实现自回归生成，解释 greedy、temperature、nucleus sampling、EOS、上下文截断和固定随机种子，并复盘学习率实验与最终样例。"
+publishedAt: "2026-09-08"
+category: "技术"
+tags:
+  - "CS336"
+  - "Text Generation"
+  - "Sampling"
+  - "Transformer"
+  - "实验分析"
+featured: false
+draft: false
+---
+
+训练把模型变成“给定一段 token，为每个位置输出 next-token logits”的函数。生成则反复使用最后一个位置的 logits，把新 token 接回输入，直到达到长度上限或生成结束符。
+
+这篇文章连接课程 Assignment 1 的最后一段：从 checkpoint 恢复模型，用 greedy、temperature sampling 和 top-p sampling 解码，再用固定 seed、验证 loss、perplexity 和可比实验判断结果。
+
+训练循环见[《CS336 训练循环》](/posts/cs336-training-loop-checkpoint)，loss、AdamW 与学习率公式见[《CS336 训练数学》](/posts/cs336-loss-adamw-schedule)。
+
+## 1. 自回归生成只有一个核心循环
+
+给定 prompt token：
+
+```text
+[x_0, x_1, ..., x_{T-1}]
+```
+
+模型输出：
+
+```text
+logits shape = [B, T, V]
+```
+
+生成只需要最后一个位置：
+
+```python
+next_token_logits = logits[:, -1, :]
+```
+
+它的形状是 `[B,V]`，表示“在完整当前上下文之后，下一个 token 是每个词表项的分数”。采样得到 `[B,1]` 的 next token，再拼到序列右侧：
+
+```python
+generated = torch.cat(
+    [generated, next_token],
+    dim=1,
+)
+```
+
+如此重复就是 autoregressive decoding。
+
+## 2. 为什么只保留最后 `context_length` 个 token
+
+模型训练时最大上下文长度为 256，RoPE cache 和 causal mask 都围绕这个上限构造。生成序列增长后，送入模型的上下文需要截断：
+
+```python
+context = generated[:, -model.context_length:]
+```
+
+注意我们只截断模型输入，`generated` 仍保留完整历史用于最终解码。模型在第 300 个输出位置只能看到最近 256 个 token，但最终打印的文本不会只剩最后 256 个。
+
+这种做法是滑动窗口，不会使用早期 token 的 hidden-state cache。每生成一个 token 都重新计算整个可见上下文，容易理解但计算重复。生产推理通常使用 KV cache：过去 token 的 K/V 不再重新计算，只为新 token 计算一份 Q/K/V。
+
+## 3. Greedy decoding
+
+greedy 每步选择最大 logit：
+
+$$
+x_{t+1}=\arg\max_i z_i.
+$$
+
+代码：
+
+```python
+next_token = torch.argmax(
+    next_token_logits,
+    dim=-1,
+    keepdim=True,
+)
+```
+
+它不需要先做 softmax，因为 softmax 是单调变换，最大概率的索引与最大 logit 的索引相同。
+
+优点是简单、确定；缺点是每一步只保留局部最可能 token，容易进入重复、模板化或平庸的序列。它也不是全局最可能序列搜索：每步局部 argmax 不保证整段联合概率最大。
+
+我用相同 prompt 运行两次并比较输出：
+
+```bash
+cmp -s /tmp/greedy_a.txt /tmp/greedy_b.txt \
+  && echo "greedy is deterministic"
+```
+
+得到：
+
+```text
+greedy is deterministic
+```
+
+前提是模型计算本身使用确定性路径且处于 `eval()` 模式；不同设备或底层 kernel 仍可能带来极小数值差异。
+
+## 4. Temperature 改变分布尖锐程度
+
+temperature sampling 使用：
+
+$$
+p_i
+=\frac{\exp(z_i/\tau)}
+{\sum_j\exp(z_j/\tau)}.
+$$
+
+- $\tau<1$：放大 logit 差异，分布更尖锐，更保守；
+- $\tau=1$：保持模型原分布；
+- $\tau>1$：压缩差异，分布更平坦，更多样也更容易出错；
+- $\tau\to0^+$：趋近 greedy，但不能真的除以 0。
+
+最小实现：
+
+```python
+def sample_next_token(logits, temperature):
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+
+    scaled_logits = logits / temperature
+    probabilities = softmax(scaled_logits, dim=-1)
+    return torch.multinomial(
+        probabilities,
+        num_samples=1,
+    )
+```
+
+temperature 不改变 token 的相对排序，但改变概率差距。因此 top-p 候选集合也可能随着 temperature 变化：排序通常不变，但累计概率达到阈值的位置会变化。
+
+## 5. Top-p 只保留累计概率足够的最小前缀
+
+Top-p，也叫 nucleus sampling。先按概率从大到小排序：
+
+$$
+p_{(1)}\ge p_{(2)}\ge\cdots\ge p_{(V)}.
+$$
+
+寻找最小的 $k$，满足：
+
+$$
+\sum_{i=1}^{k}p_{(i)}\ge p.
+$$
+
+只在前 $k$ 个 token 中重新归一化并采样。与固定 top-k 不同，候选数量会根据模型置信度自动变化：分布很尖时可能只保留少数 token，分布平坦时会保留更多。
+
+我的实现是：
+
+```python
+def sample_top_p(logits, temperature, top_p):
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    if not 0 < top_p <= 1:
+        raise ValueError("top_p must be in (0, 1]")
+
+    scaled_logits = logits / temperature
+    probabilities = softmax(scaled_logits, dim=-1)
+
+    sorted_probabilities, sorted_indices = torch.sort(
+        probabilities,
+        dim=-1,
+        descending=True,
+    )
+    cumulative_probabilities = torch.cumsum(
+        sorted_probabilities,
+        dim=-1,
+    )
+
+    remove = cumulative_probabilities > top_p
+    remove[..., 1:] = remove[..., :-1].clone()
+    remove[..., 0] = False
+
+    sorted_probabilities = sorted_probabilities.masked_fill(
+        remove,
+        0.0,
+    )
+
+    filtered_probabilities = torch.zeros_like(probabilities)
+    filtered_probabilities.scatter_(
+        dim=-1,
+        index=sorted_indices,
+        src=sorted_probabilities,
+    )
+
+    filtered_probabilities /= filtered_probabilities.sum(
+        dim=-1,
+        keepdim=True,
+    )
+
+    return torch.multinomial(
+        filtered_probabilities,
+        num_samples=1,
+    )
+```
+
+### 为什么 `remove` 要右移一位
+
+若直接删除 `cumulative_probability > top_p` 的位置，那个让累计概率第一次越过阈值的 token 也会被删掉，剩余概率总和反而小于 $p$。
+
+```python
+remove[..., 1:] = remove[..., :-1].clone()
+remove[..., 0] = False
+```
+
+把 mask 右移后，首次越过阈值的 token 被保留；第一个 token 永远保留，因此不会得到空分布。
+
+### 为什么需要 `scatter_`
+
+采样时 token ID 必须仍然是原词表索引。排序后位置 0 只表示“当前概率最大”，不再表示 token ID 0。`scatter_` 用 `sorted_indices` 把过滤后的概率放回原 token ID 坐标。
+
+## 6. 当前生成脚本中的一个真实接线问题
+
+CLI 把 `args.top_p` 传进 `generate()`：
+
+```python
+output_ids = generate(
+    ...,
+    top_p=args.top_p,
+)
+```
+
+但当前 `generate()` 内部写成了：
+
+```python
+next_token = sample_top_p(
+    next_token_logits,
+    temperature=temperature,
+    top_p=0.9,
+)
+```
+
+这意味着命令行 `--top-p` 目前不会改变实际采样阈值。应该改为：
+
+```python
+next_token = sample_top_p(
+    next_token_logits,
+    temperature=temperature,
+    top_p=top_p,
+)
+```
+
+这是一个典型的“参数存在但没有接线”问题。默认值本来就是 0.9，所以用默认命令测试时看不出来；必须用两个明显不同的值，或给 `sample_top_p` 加 mock/定向测试，才能确认参数真的传到底层。
+
+## 7. EOS 为什么既是 token，也是控制信号
+
+`<|endoftext|>` 在 tokenizer 中有普通整数 ID。生成时模型如果采到它，语义是文本结束：
+
+```python
+finished |= (
+    next_token.squeeze(-1) == eos_token_id
+)
+
+if finished.all():
+    break
+```
+
+`finished` 的形状是 `[B]`，因此支持 batch 中每条序列分别记录状态。
+
+不过当前实现只在所有序列都结束时退出，没有冻结已经结束的那几条。batch size 大于 1 时，较早生成 EOS 的序列仍会继续追加 token。更完整的实现会把已结束序列的后续 token 固定为 EOS 或 padding，并只让未结束序列继续采样。
+
+单条生成时这个问题不会出现：一旦唯一序列产生 EOS，`finished.all()` 立即为真。
+
+## 8. 完整生成循环
+
+```python
+@torch.no_grad()
+def generate(
+    model,
+    prompt_ids,
+    max_new_tokens,
+    temperature,
+    top_p,
+    eos_token_id=None,
+    greedy=False,
+):
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+
+    model.eval()
+    generated = prompt_ids
+    finished = torch.zeros(
+        prompt_ids.shape[0],
+        dtype=torch.bool,
+        device=prompt_ids.device,
+    )
+
+    for _ in range(max_new_tokens):
+        context = generated[:, -model.context_length:]
+        logits = model(context)
+        next_token_logits = logits[:, -1, :]
+
+        if greedy:
+            next_token = torch.argmax(
+                next_token_logits,
+                dim=-1,
+                keepdim=True,
+            )
+        else:
+            next_token = sample_top_p(
+                next_token_logits,
+                temperature=temperature,
+                top_p=top_p,
+            )
+
+        generated = torch.cat(
+            [generated, next_token],
+            dim=1,
+        )
+
+        if eos_token_id is not None:
+            finished |= (
+                next_token.squeeze(-1) == eos_token_id
+            )
+            if finished.all():
+                break
+
+    return generated
+```
+
+`@torch.no_grad()` 与 `model.eval()` 仍然解决不同问题：前者不构建梯度图，后者切换 module 行为。生成不需要 backward，保留计算图只会浪费内存。
+
+## 9. 固定 seed 能复现什么
+
+```python
+torch.manual_seed(args.seed)
+```
+
+`torch.multinomial` 消耗 PyTorch RNG。模型、prompt、设备、代码路径和 seed 都相同时，采样序列应相同。
+
+我运行两次：
+
+```bash
+uv run python experiments/generate_text.py \
+  --prompt "Once upon a time" \
+  --temperature 0.8 \
+  --top-p 0.9 \
+  --seed 42 > /tmp/sample_a.txt
+
+uv run python experiments/generate_text.py \
+  --prompt "Once upon a time" \
+  --temperature 0.8 \
+  --top-p 0.9 \
+  --seed 42 > /tmp/sample_b.txt
+
+cmp -s /tmp/sample_a.txt /tmp/sample_b.txt \
+  && echo "sampling with fixed seed is deterministic"
+```
+
+结果：
+
+```text
+sampling with fixed seed is deterministic
+```
+
+固定 seed 不等于跨所有硬件、PyTorch 版本和 kernel 永远位级一致。它首先保证的是同一环境、同一程序中的实验可重复。
+
+## 10. 临时输出文件在哪里
+
+重定向：
+
+```bash
+... > /tmp/greedy_a.txt
+```
+
+会把标准输出写到 macOS 的 `/tmp` 目录，而不是项目目录。实验中使用过：
+
+```text
+/tmp/greedy.txt
+/tmp/temp05.txt
+/tmp/temp08.txt
+/tmp/temp12.txt
+/tmp/greedy_a.txt
+/tmp/greedy_b.txt
+/tmp/sample_a.txt
+/tmp/sample_b.txt
+```
+
+`/tmp` 适合短期比较，系统可能清理它。要长期保留，应写到项目的 `artifacts/generations/`，并把模型配置、checkpoint step 和采样参数写进文件名或旁边的元数据。
+
+## 11. 学习率 sweep 如何做到可比
+
+实验只改变一个主要变量，其他条件固定：
+
+```text
+模型结构、初始化 seed
+训练/验证语料
+batch size、context length
+warmup 与训练步数
+评估间隔与 eval batches
+采样协议
+```
+
+200-step 学习率 sweep 的最终结果：
+
+| max learning rate | validation loss | perplexity |
+| ---: | ---: | ---: |
+| 0.001 | 3.092892 | 约 22.04 |
+| 0.002 | **2.993847** | **约 19.96** |
+| 0.003 | 3.082793 | 约 21.82 |
+
+在这些检查点上，`2e-3` 最好。但结论的边界是“这个模型、数据、batch、schedule 和短训练预算下”；它不是所有 Transformer 的普遍最佳学习率。
+
+把 `2e-3` 延长到 500 steps 后，验证 loss 为：
+
+| step | validation loss |
+| ---: | ---: |
+| 100 | 3.3444 |
+| 200 | 2.8603 |
+| 300 | 2.6022 |
+| 400 | 2.4591 |
+| 500 | 2.4023 |
+
+对应 perplexity：
+
+$$
+\exp(2.4023)\approx11.05.
+$$
+
+验证 loss 继续下降，说明 200 steps 时还没有训练充分。
+
+## 12. 正式 5000-step 训练结果
+
+模型配置：
+
+```text
+vocab_size     = 10,000
+context_length = 256
+d_model        = 512
+num_layers     = 4
+num_heads      = 16
+d_ff           = 1,344
+batch_size     = 32
+max_lr         = 0.002
+min_lr         = 0.0002
+warmup_iters   = 250
+num_steps      = 5,000
+```
+
+最终指标：
+
+```text
+train loss      = 1.713043
+validation loss = 1.708244
+perplexity      = 5.52
+tokens          = 40,960,000
+time            = 6,939.81 s
+throughput      = 5,902 token/s
+```
+
+这里 train loss 与 validation loss 非常接近，没有表现出明显的训练集/验证集分叉。但它只说明当前训练预算和验证协议下没有明显过拟合，不能仅凭最后一个点证明泛化能力。
+
+## 13. 生成样例应该怎样读
+
+checkpoint step 5000、prompt `Once upon a time`、temperature 0.8、top-p 0.9、seed 42 的一段输出是：
+
+> Once upon a time, there was a little girl named Lucy. She was a happy girl who loved to play with her toys. One day, Lucy found a big, heavy rock in her yard.
+
+另一个 seed 产生不同故事主题：
+
+> Once upon a time, there was a little boy named Tim. Tim loved to play outside. One day, he found a big book called a dictionary.
+
+它们说明模型已经学到 TinyStories 的局部结构：固定开头、角色命名、简单冲突、直接引语和儿童故事语气。但也能看到小模型与有限训练的典型问题：
+
+- 事件因果偶尔不连贯；
+- 指代可能错误；
+- 会出现 `mom anddad`、`Theywould` 一类空格问题；
+- 达到 `max_new_tokens` 时句子可能被截断；
+- 长距离人物和物体状态不稳定。
+
+空格问题不一定全是 detokenizer bug。Byte-level BPE token 经常把前导空格作为 token 的一部分；模型若预测了不带前导空格的词片段，就可能拼成相邻单词。应先检查输出 token bytes，再判断是 tokenizer 往返错误还是语言模型概率错误。
+
+## 14. 经典问题
+
+### 为什么生成比训练慢得多
+
+训练时整段正确 token 已知，causal mask 让所有位置一次并行计算；生成时第 $t+1$ 个 token 必须等待第 $t$ 个 token 被选出。没有 KV cache 的当前实现还会重复计算整个窗口。
+
+### Temperature 与 top-p 谁先做
+
+当前实现先用 temperature 缩放 logits，再 softmax，然后按 top-p 截断。这是常见顺序。因为 temperature 改变累计概率，所以交换顺序会得到不同候选集合。
+
+### `top_p=1` 会发生什么
+
+累计概率在最后一个 token 才达到 1，经过右移 mask 后所有非零概率都会保留，因此退化为完整分布的 temperature sampling。
+
+### Greedy 还需要 temperature 吗
+
+不需要。正温度缩放不改变 logits 排序，所以 argmax 不变。CLI 可以保留 temperature 参数以统一接口，但 greedy 分支不会使用它。
+
+### 为什么不把 EOS 文本打印出来
+
+EOS 是控制边界，不是故事内容。tokenizer decode 是否显示它取决于词表与调用策略。通常生成循环看到 EOS 就停止，并在展示文本时排除它。
+
+### 生成得通顺是否证明训练正确
+
+不能。单个样例容易挑选，也可能来自训练数据记忆。训练正确性还需要 loss 曲线、validation、checkpoint resume、不同 seed、多个 prompt 和 tokenizer round-trip 检查。
+
+## 15. 一套更可靠的生成实验
+
+1. 固定一个 checkpoint 和一组 prompts；
+2. greedy 运行两次，确认确定性；
+3. 固定 seed 的 sampling 运行两次，确认 RNG 接线；
+4. 固定 top-p，比较 temperature 0.5、0.8、1.2；
+5. 固定 temperature，比较多个 top-p；
+6. 对每组参数使用多个 seed，不凭一条故事下结论；
+7. 记录 EOS 命中率、平均生成长度、重复率与人工可读性；
+8. 保留 prompt、checkpoint、完整参数和输出文件。
+
+Assignment 1 的价值并不只是一份会生成故事的程序。完整闭环是：从 UTF-8 bytes 和 BPE 开始，得到 token ID；从 token ID 实现 Transformer；从 logits 推导稳定 loss；从梯度实现 AdamW；最后用可恢复训练和可复现实验验证模型确实学到了东西。
+
+系列起点可以回到[《CS336 train_bpe 实战》](/posts/cs336-train-bpe-performance)，模型结构见[《CS336 Transformer 从零实现》](/posts/cs336-transformer-from-scratch)。

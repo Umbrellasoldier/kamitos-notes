@@ -2,6 +2,7 @@
 title: "CS336 Transformer 从零实现：从张量形状到完整语言模型"
 description: "从 next-token prediction 开始，逐步实现 Linear、Embedding、RMSNorm、SwiGLU、RoPE、稳定 softmax、因果多头注意力、pre-norm block 与 TransformerLM，并解释每个形状、公式、不变量和调试陷阱。"
 publishedAt: "2026-08-29"
+updatedAt: "2026-09-08"
 category: "技术"
 tags:
   - "CS336"
@@ -1433,4 +1434,58 @@ $$
 
 但“能写出这四行”与“真正理解实现”之间，还隔着 Q/K/V 的形状、causal mask 的方向、RoPE 的旋转约定、稳定 softmax、module 注册和 residual 数据流。逐层实现的价值就在这里：抽象不再是需要背诵的名词，而是每一个都能用形状、公式、代码和测试解释的具体对象。
 
-接下来，模型已经能产生 `[B,T,V]` logits。训练它还需要四块：从 `uint16` memmap 采样 `(inputs, targets)`、稳定 cross entropy、AdamW 与 cosine learning-rate schedule，以及包含梯度裁剪和 checkpoint 的训练循环。那些属于 Transformer **训练**，会在下一篇单独展开；本文到“完整模型前向通过 13 项定向测试”为止。
+## 21. 几个贯穿整章的经典问题
+
+### 为什么 attention 输出要加回输入 $x$
+
+Residual connection 让每个子层学习“在已有表示上增加什么”，而不是每层都从头重写全部信息：
+
+$$
+y=x+f(x).
+$$
+
+若注意力暂时学不到有用内容，理论上 $f(x)$ 可以接近 0，信息仍能沿 identity path 向后传播；反向梯度也有一条不必连续穿过所有非线性变换的直接路径。
+
+### 为什么 pre-norm 用归一化后的输入计算子层，却把结果加到未归一化 residual 上
+
+pre-norm block 是：
+
+$$
+y=x+\operatorname{Attention}(\operatorname{RMSNorm}(x)).
+$$
+
+RMSNorm 控制进入复杂子层的尺度，residual stream 则保留跨层传递的信息。若把 residual 也替换为归一化结果，网络状态会在每层被强制重写，已不是同一个结构。
+
+### 为什么每个 head 独立 attention，却只调用一次 RoPE module
+
+Q/K 拆头后的形状是 `[B,H,T,d_h]`。RoPE 在最后一维上对每对坐标旋转，并通过广播同时作用于 $B$ 和 $H$，所以数学上每个 head 独立旋转，代码上不需要 Python 循环调用 $H$ 次。
+
+### 为什么 RoPE 不改变向量范数
+
+每个二维子空间乘正交旋转矩阵 $R$：
+
+$$
+\lVert Rx\rVert_2^2
+=x^TR^TRx
+=x^Tx.
+$$
+
+它改变方向而不改变长度，因此位置信息进入 Q/K 的角度关系，而不是靠放大某些位置的向量幅度。
+
+### 为什么 causal mask 的形状常是 `[T,T]`，却能用于 `[B,H,T,T]`
+
+batch 和 head 维共享同一个“位置 $i$ 能否看位置 $j$”规则。广播把 `[T,T]` mask 视为 `[1,1,T,T]`，无需为每个 batch、每个 head 复制一份。
+
+### 为什么模型输出 logits 而不是 token ID
+
+训练需要完整的 $V$ 类分数计算 cross entropy；生成也需要完整分布才能使用 temperature 或 top-p。argmax 只是众多解码策略之一，不属于模型前向本身。
+
+## 系列导航
+
+接下来，模型已经能产生 `[B,T,V]` logits。训练它需要从 `uint16` memmap 采样 `(inputs, targets)`、稳定 cross entropy、AdamW、cosine learning-rate schedule、梯度裁剪和 checkpoint：
+
+1. [《CS336 训练数学：从 Cross Entropy 到 AdamW、Warmup 与梯度裁剪》](/posts/cs336-loss-adamw-schedule)
+2. [《CS336 训练循环：从 memmap Batch 到 Checkpoint 与可恢复实验》](/posts/cs336-training-loop-checkpoint)
+3. [《CS336 文本生成与实验分析：Greedy、Temperature、Top-p 与可复现性》](/posts/cs336-generation-and-experiments)
+
+本文到“完整模型前向通过 13 项定向测试”为止；后三篇继续完成从 logits、梯度、参数更新到最终故事生成的闭环。

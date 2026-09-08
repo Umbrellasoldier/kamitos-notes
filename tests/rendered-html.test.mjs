@@ -31,8 +31,9 @@ test("首页呈现正式品牌、精选旧文且不会重复", async () => {
   assert.match(html, /src="\/og\.png"/);
   assert.match(html, /算法竞赛进阶指南：基本算法与数据结构/);
   assert.match(html, /CS336 Transformer 从零实现：从张量形状到完整语言模型/);
-  assert.match(html, /CS336 train_bpe 实战：从正确实现到 3\.5 倍性能优化/);
-  assert.match(html, /CS336 第二讲笔记：PyTorch、显存与计算资源核算/);
+  assert.match(html, /CS336 文本生成与实验分析：Greedy、Temperature、Top-p 与可复现性/);
+  assert.match(html, /CS336 训练数学：从 Cross Entropy 到 AdamW、Warmup 与梯度裁剪/);
+  assert.match(html, /CS336 训练循环：从 memmap Batch 到 Checkpoint 与可恢复实验/);
   assert.doesNotMatch(html, /target="_top"/);
   assert.doesNotMatch(html, /\/_next\/static\/chunks\/link-[^"]+\.js/);
   assert.equal(
@@ -74,6 +75,9 @@ test("主要页面和聚合页均可渲染", async () => {
     "/posts/cs336-train-bpe-performance",
     "/posts/cs336-lecture-02-pytorch-resource-accounting",
     "/posts/cs336-transformer-from-scratch",
+    "/posts/cs336-loss-adamw-schedule",
+    "/posts/cs336-training-loop-checkpoint",
+    "/posts/cs336-generation-and-experiments",
     "/posts/kimi-k3-architecture-from-zero",
     "/about",
     "/categories",
@@ -126,7 +130,7 @@ test("CS336 第一讲笔记包含课程主线、BPE 实现和官方资料", asyn
   assert.match(html, /Byte Latent Transformer/);
   assert.match(html, /Foundation Models and Fair Use/);
   assert.match(html, /assignment5-alignment/);
-  assert.match(html, /更新于.*2026年8月15日/);
+  assert.match(html, /更新于.*2026年9月8日/);
   assert.match(html, /\/posts\/cs336-lecture-01-overview-tokenization\/wei-emergence-plot\.png/);
   assert.match(html, /\/posts\/cs336-lecture-01-overview-tokenization\/transformer-architecture\.png/);
   assert.match(html, /\/posts\/cs336-lecture-01-overview-tokenization\/compute-memory\.png/);
@@ -175,7 +179,7 @@ test("CS336 train_bpe 实战保留性能数据、代码与关联阅读", async (
   assert.match(html, /merge 循环约快了 8\.8 倍/);
   assert.match(html, /3,340,216,780 tokens/);
   assert.match(html, /uint16/);
-  assert.match(html, /更新于.*2026年8月29日/);
+  assert.match(html, /更新于.*2026年9月8日/);
   assert.match(html, /href="\/posts\/cs336-lecture-01-overview-tokenization"/);
   assert.match(html, /href="\/posts\/karpathy-build-gpt-tokenizer"/);
   assert.match(html, /href="\/posts\/cs336-transformer-from-scratch"/);
