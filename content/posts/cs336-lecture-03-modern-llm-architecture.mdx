@@ -1,0 +1,474 @@
+---
+title: "CS336 第三讲：现代大语言模型架构与超参数"
+description: "结合 Stanford CS336 Lecture 3 讲义、视频和我的 Assignment 1 实现，理解 Pre-Norm、RMSNorm、SwiGLU、RoPE、注意力变体、模型宽深比、训练稳定性与 KV Cache。"
+publishedAt: "2026-09-09"
+updatedAt: "2026-09-09"
+category: "技术"
+tags:
+  - "CS336"
+  - "Transformer"
+  - "大语言模型"
+  - "PyTorch"
+  - "模型架构"
+featured: false
+draft: false
+---
+
+这篇文章整理 Stanford CS336 第三讲 **Everything You Didn't Want to Know About LM Architecture and Hyperparameters**。我同时参考了[第三讲视频（第 3 集）](https://www.bilibili.com/video/BV11LEA6eEuj/?p=3)和 Stanford 官方的 [lecture_03.pdf](https://github.com/stanford-cs336/lectures/blob/main/lecture_03.pdf)。视频负责把问题讲得直观，讲义负责给出模型家族、实验观察和公式；下面再把它们和我在 Assignment 1 中真正写出的代码接起来。
+
+这不是一篇“现代模型都这么做，所以照抄就行”的配置清单。更重要的问题是：
+
+- 一个 Transformer block 为什么会从 post-norm 变成 pre-norm；
+- RMSNorm、SwiGLU、RoPE 分别解决了什么问题；
+- 哪些超参数有经验共识，哪些只是工程折中；
+- 为什么训练稳定性和推理时的显存访问，会反过来影响架构设计。
+
+## 1. 先回到我在作业里实现的模型
+
+第三讲开头先回顾一个现代的 dense Transformer。对 batch size 为 $B$、序列长度为 $T$、模型维度为 $D$、词表大小为 $V$ 的语言模型，数据流是：
+
+~~~text
+token IDs             [B, T]
+  -> token embedding  [B, T, D]
+  -> N 个 TransformerBlock
+hidden states         [B, T, D]
+  -> final norm        [B, T, D]
+  -> language-model head
+logits                 [B, T, V]
+~~~
+
+我的 `TransformerLM` 也是这条路径：
+
+~~~python
+x = self.token_embeddings(in_indices)
+for layer in self.layers:
+    x = layer(x, token_positions)
+x = self.ln_final(x)
+logits = self.lm_head(x)
+~~~
+
+每一层都保持最后一维是 $D$，因此可以做残差连接。一个 block 的抽象形式是：
+
+$$
+x \longrightarrow x + \operatorname{Attention}(\operatorname{Norm}(x))
+\longrightarrow y + \operatorname{FFN}(\operatorname{Norm}(y)).
+$$
+
+这里的关键不是“有一个注意力层和一个 MLP”这么简单，而是 **norm 放在哪里、位置如何编码、FFN 使用什么激活、Q/K/V 如何存储**。这些小选择会改变训练稳定性、吞吐量和生成时的显存成本。
+
+## 2. 原始 Transformer 与现代变体
+
+| 部件 | 原始 Transformer | 这份作业中的现代变体 |
+| --- | --- | --- |
+| 残差与归一化 | post-norm LayerNorm | pre-norm RMSNorm |
+| 位置表示 | 正弦、余弦绝对位置编码 | RoPE |
+| FFN 激活 | ReLU | SwiGLU |
+| Linear / norm bias | 常见 | 省略 bias |
+| 注意力 | 标准多头注意力 | 因果多头注意力，可加 RoPE |
+
+这并不意味着原始设计“错误”。它是在 2017 年的硬件、数据规模和训练条件下被验证的。随着模型变深、序列变长、训练 token 增多，工程目标发生变化，架构也随之演化。
+
+## 3. Pre-Norm：让残差主干保持通畅
+
+### 3.1 两种写法
+
+Post-norm 的典型写法是：
+
+$$
+x_{l+1}=\operatorname{Norm}\bigl(x_l+F_l(x_l)\bigr).
+$$
+
+Pre-norm 则是：
+
+$$
+x_{l+1}=x_l+F_l\bigl(\operatorname{Norm}(x_l)\bigr).
+$$
+
+在 pre-norm 中，残差主干里始终存在一个直接的 $x_l$：
+
+$$
+\frac{\partial x_{l+1}}{\partial x_l}
+=I+\frac{\partial F_l(\operatorname{Norm}(x_l))}{\partial x_l}.
+$$
+
+梯度可以沿着 $I$ 这条路径跨过很多层，不必每一层都乘一个可能缩小或放大的归一化变换。这是为什么深层模型通常更容易训练、对 warmup 和学习率更宽容的直觉。
+
+### 3.2 对应我的实现
+
+~~~python
+attention_input = self.ln1(x)
+attention_update = self.attn(attention_input, token_positions)
+y = x + attention_update
+
+ffn_input = self.ln2(y)
+ffn_update = self.ffn(ffn_input)
+z = y + ffn_update
+return z
+~~~
+
+注意 `self.ln1(x)` 的结果没有直接替换 `x`。`x` 保留为残差主干，注意力只产生一个 update。这是“pre-norm”比“把 `x` 先归一化后再一路传下去”更准确的理解。
+
+现代模型普遍采用不把 norm 放在残差主干内部的设计，最常见的就是 pre-norm；也有模型在残差流外再加一个额外的 post-norm。它不是“永远更好”，而是深度、初始化、学习率和训练配方共同作用下的稳定选择。
+
+## 4. LayerNorm 与 RMSNorm
+
+LayerNorm 对一个 token 的隐藏向量 $x\in\mathbb{R}^{D}$ 先计算：
+
+$$
+\mu=\frac{1}{D}\sum_{i=1}^{D}x_i,
+\qquad
+\sigma^2=\frac{1}{D}\sum_{i=1}^{D}(x_i-\mu)^2.
+$$
+
+然后：
+
+$$
+\operatorname{LN}(x)=\gamma\odot\frac{x-\mu}{\sqrt{\sigma^2+\epsilon}}+\beta.
+$$
+
+RMSNorm 不减均值，只按均方根缩放：
+
+$$
+\operatorname{RMS}(x)=\gamma\odot
+\frac{x}{\sqrt{\frac{1}{D}\sum_{i=1}^{D}x_i^2+\epsilon}}.
+$$
+
+因此它通常少一次统计、少一个 bias 参数。矩阵乘法仍然占据大部分 FLOPs，但归一化会读写大量激活，属于容易受内存带宽影响的操作；少一次统计和参数读写可能改善实际 wall-clock 时间。
+
+我的实现先用 float32 计算统计量：
+
+~~~python
+input_type = x.dtype
+x_float = x.to(torch.float32)
+rms = torch.sqrt(
+    x_float.pow(2).mean(dim=-1, keepdim=True) + self.eps
+)
+output = x_float / rms * self.weight
+return output.to(input_type)
+~~~
+
+如果输入是 `float16` 或 `bfloat16`，直接平方和求平均更容易积累舍入误差。统计量用 float32 算完，再把输出转回原 dtype，是一种常见的稳定折中。`eps` 则避免接近全零的向量导致分母为零。
+
+## 5. FFN：从 ReLU 到 SwiGLU
+
+普通前馈层是：
+
+$$
+\operatorname{FFN}(x)=\sigma(xW_1)W_2.
+$$
+
+它先把维度从 $D$ 扩大到 $F$，通过激活函数，再投影回 $D$。GLU 让一条分支控制另一条分支：
+
+$$
+\operatorname{GLU}(x)=\phi(xW_1)\odot(xW_3).
+$$
+
+SwiGLU 使用 SiLU（Swish）：
+
+$$
+\operatorname{SiLU}(x)=x\cdot\operatorname{sigmoid}(x),
+$$
+
+因此：
+
+$$
+\operatorname{SwiGLU}(x)=
+\bigl(\operatorname{SiLU}(xW_1)\odot xW_3\bigr)W_2.
+$$
+
+对应我的代码：
+
+~~~python
+def silu(x):
+    return x * torch.sigmoid(x)
+
+def forward(self, x):
+    return self.w2(silu(self.w1(x)) * self.w3(x))
+~~~
+
+形状为：
+
+~~~text
+w1.weight: [F, D]
+w3.weight: [F, D]
+w2.weight: [D, F]
+
+x         [B, T, D]
+w1(x)     [B, T, F]
+w3(x)     [B, T, F]
+w2(...)   [B, T, D]
+~~~
+
+门控 FFN 有三组投影，而普通 FFN 只有两组。为了让参数量和计算量大致可比，很多模型把门控版本的中间维度从 $4D$ 缩小到约：
+
+$$
+d_{ff}\approx\frac{8}{3}d_{model}.
+$$
+
+这是参数预算下的经验折中，不是数学定律。常见模型大多在约 $2.5D$ 到 $3.5D$ 之间；原始非门控 FFN 的经验起点仍是 $4D$。
+
+## 6. 位置表示：为什么 RoPE 能表达相对位置
+
+绝对位置编码是把位置向量加到 token embedding：
+
+$$
+h_i=v_{x_i}+u_i.
+$$
+
+它能告诉模型“这是第几个位置”，但注意力点积会出现内容和位置的交叉项，不会天然只依赖位置差。理想的相对位置机制，希望满足：
+
+$$
+\langle f(x,i),f(y,j)\rangle=g(x,y,i-j).
+$$
+
+RoPE 把每两个坐标组成一个二维平面，对第 $i$ 个位置旋转角度 $i\theta_k$：
+
+$$
+R(\alpha)=
+\begin{bmatrix}
+\cos\alpha & -\sin\alpha\\
+\sin\alpha & \cos\alpha
+\end{bmatrix}.
+$$
+
+如果 query 在位置 $i$ 旋转，key 在位置 $j$ 旋转，则：
+
+$$
+\langle R(i\theta)q,R(j\theta)k\rangle
+=\langle q,R((j-i)\theta)k\rangle.
+$$
+
+关键是旋转矩阵的正交性：
+
+$$
+R(i\theta)^\top R(j\theta)=R((j-i)\theta).
+$$
+
+所以绝对位置被吸收到旋转中，QK 点积最终体现相对位置差。
+
+我的实现预先计算频率和 sin/cos cache：
+
+~~~python
+pair_indices = torch.arange(d_k // 2, dtype=torch.float32)
+frequencies = theta ** (-2 * pair_indices / d_k)
+positions = torch.arange(max_seq_len, dtype=torch.float32)
+angles = positions[:, None] * frequencies[None, :]
+cos_cache = torch.cos(angles)
+sin_cache = torch.sin(angles)
+~~~
+
+前向时把偶数和奇数坐标配成二维向量：
+
+~~~python
+x_even = x[..., 0::2]
+x_odd = x[..., 1::2]
+out_even = x_even * cos - x_odd * sin
+out_odd = x_even * sin + x_odd * cos
+output = torch.stack((out_even, out_odd), dim=-1).flatten(-2)
+~~~
+
+RoPE 只应用于 Q 和 K，不应用于 V。QK 决定“看谁”，V 携带被读取的内容。在多头注意力中，`d_k` 是每个 head 的维度，而不是整个 `d_model`。
+
+## 7. 从 QKV 到因果多头注意力
+
+令 $H$ 为 head 数，$d_h=D/H$：
+
+~~~text
+x       [B, T, D]
+Q/K/V   [B, T, D]
+split   [B, H, T, d_h]
+scores  [B, H, T, T]
+output  [B, H, T, d_h]
+join    [B, T, D]
+~~~
+
+缩放点积注意力为：
+
+$$
+\operatorname{Attention}(Q,K,V)=
+\operatorname{softmax}\left(\frac{QK^\top}{\sqrt{d_h}}+M\right)V.
+$$
+
+除以 $\sqrt{d_h}$ 是为了控制点积方差。因果 mask 把未来位置设为 $-\infty$：
+
+$$
+M_{ij}=
+\begin{cases}
+0,&j\le i,\\
+-\infty,&j>i.
+\end{cases}
+$$
+
+softmax 后未来位置的概率就是 0。我的代码用布尔 mask：
+
+~~~python
+positions = torch.arange(T, device=x.device)
+causal_mask = positions[:, None] >= positions[None, :]
+scores = scores.masked_fill(~causal_mask, -torch.inf)
+~~~
+
+softmax 计算时先减去每行最大值：
+
+$$
+\operatorname{softmax}(z)_i
+=\frac{e^{z_i-m}}{\sum_j e^{z_j-m}},
+\qquad m=\max_j z_j.
+$$
+
+这不会改变概率，却能避免 `exp(1000)` 溢出。
+
+## 8. Head 数、层宽与并行方式
+
+Assignment 1 为了方便 reshape，要求：
+
+$$
+d_{model}\bmod H=0,
+\qquad d_h=d_{model}/H.
+$$
+
+这不是理论必然，而是我的 `rearrange` 实现所依赖的不变量。也可以选择 $Hd_h$ 不等于 $d_{model}$，再用输出投影映回模型维度；大多数模型只是经验上让二者接近。
+
+标准 block 是串行的：
+
+$$
+y=x+\operatorname{Attn}(\operatorname{Norm}_1(x)),
+\qquad
+z=y+\operatorname{FFN}(\operatorname{Norm}_2(y)).
+$$
+
+并行 block 让 attention 和 FFN 都从同一个输入计算：
+
+$$
+z=x+\operatorname{Attn}(\operatorname{Norm}(x))
++\operatorname{FFN}(\operatorname{Norm}(x)).
+$$
+
+GPT-J、PaLM、GPT-NeoX 等模型探索过并行层。它可能帮助 kernel 融合和减少同步，但改变了表达形式；实际收益取决于内存读写、kernel 和通信，而不是“数学上能同时计算”这一点。
+
+## 9. 三个重要超参数
+
+### 9.1 FFN 比模型维度大多少
+
+非门控 FFN 的经验起点是：
+
+$$
+d_{ff}\approx4d_{model}.
+$$
+
+SwiGLU 等门控版本常用：
+
+$$
+d_{ff}\approx\frac{8}{3}d_{model},
+$$
+
+再向上取整到硬件友好的倍数。增大 `d_ff` 会提高每层容量和计算量，但不保证固定 token budget 下带来同等收益。
+
+### 9.2 模型应该更深还是更宽
+
+模型宽深比可粗略写成：
+
+$$
+\frac{d_{model}}{n_{layers}}.
+$$
+
+讲义中的模型覆盖约 $60$ 到 $200$，说明不存在所有规模都最优的数字。更深的模型有更多层级组合，但并行训练和推理延迟更难处理；更宽的模型单层矩阵更大，更适合某些硬件，却减少了层级深度。
+
+这个选择同时受 loss、GPU kernel、张量并行和端到端延迟约束。不能只因为某个开源模型用了某个比例，就直接套到自己的实验。
+
+### 9.3 词表大小
+
+单语模型常见词表约 $30$k--$50$k，多语模型可能达到 $100$k--$250$k。词表增大可以让序列变短，但会增加 embedding、LM head 和输出 softmax 的参数与计算。若输入是 `[B,T]`，最终 logits 是 `[B,T,V]`，$V$ 直接出现在最后一维。
+
+这和我的 BPE 实验直接相连：词表不是越大越好，而是压缩率、跨语言覆盖、显存和输出层计算之间的折中。
+
+## 10. 正则化与训练稳定性
+
+预训练语料可能达到 trillions of tokens，远多于参数量，而且通常只遍历很少次数，因此“模型会不会把训练集背下来”的压力不同于小数据任务。较早模型常用 dropout；许多较新的模型在预训练中把 dropout 设为 0，更多依靠 weight decay。
+
+这里的 weight decay 不应简单解释为“防止过拟合”，它还会和学习率调度共同改变优化轨迹。自己的实验必须分开记录 dropout、weight decay、学习率和 token 数，否则 loss 变化很难归因。
+
+输出层可加入 z-loss，对 log-sum-exp 归一化项施加额外惩罚，帮助 logit 尺度保持可控。注意力处可加入 QK-Norm：
+
+$$
+\operatorname{softmax}\left(
+\frac{\operatorname{Norm}(Q)\operatorname{Norm}(K)^\top}{\sqrt{d_h}}
+\right).
+$$
+
+它与普通 block 中的 RMSNorm 不同：是专门插在 Q/K 到 attention score 之间的额外稳定化机制。另一个选择是 logit soft-capping：
+
+$$
+z'=c\tanh(z/c).
+$$
+
+它能限制极端值，但也可能限制模型的置信度，因此同样需要实验验证。
+
+## 11. 推理成本：GQA、MQA 与 KV Cache
+
+训练时整段序列可以并行；自回归生成时，第 $t+1$ 个 token 依赖第 $t$ 个结果，只能一步一步生成。KV Cache 保存历史 key/value，新 token 只计算自己的 Q/K/V，再把新的 K/V 追加到缓存，避免重复投影。
+
+Multi-Query Attention 让多个 query heads 共享一组 key/value heads：
+
+~~~text
+Q:   [B, Hq, T, d_h]
+K/V: [B, 1,  T, d_h]
+~~~
+
+它显著缩小 KV Cache，但可能有小幅质量损失。Grouped-Query Attention 是中间折中：
+
+~~~text
+Q:   [B, Hq, T, d_h]
+K/V: [B, Hkv, T, d_h], Hkv < Hq
+~~~
+
+`Hkv = Hq` 是普通 MHA，`Hkv = 1` 接近 MQA。GQA 用一个简单的 head 数旋钮折中显存、吞吐和质量。
+
+全注意力的分数矩阵是 $T\times T$，序列变长时成本按二次方增长。滑动窗口注意力只看附近 token，间隔若干层再使用 full attention，就能在短程效率和长程信息之间折中。
+
+## 12. 把讲义结论翻译成我的代码检查清单
+
+| 讲义概念 | 代码位置 | 应检查的不变量 |
+| --- | --- | --- |
+| 无 bias Linear | `model.py::Linear` | `weight` 是 `[out,in]`，前向是 `x @ weight.T` |
+| RMSNorm | `model.py::RMSNorm` | 统计最后一维；低精度输入用 float32 |
+| SwiGLU | `model.py::SwiGLU` | 两条 `[B,T,F]` 分支逐元素相乘，再回到 `D` |
+| RoPE | `model.py::RotaryPositionalEmbedding` | `d_k` 为偶数；只旋转 Q/K |
+| 因果注意力 | `scaled_dot_product_attention` | 第 `i` 行不能看到 `j>i` |
+| 多头 reshape | `MultiHeadSelfAttention` | `[B,T,D] <-> [B,H,T,D/H]` 语义一致 |
+| Pre-Norm block | `TransformerBlock` | 残差主干是 `x + update` |
+| 语言模型输出 | `TransformerLM` | logits 是 `[B,T,V]`，不要提前 softmax |
+
+我跑过的 focused tests 包含 `test_multihead_self_attention`、`test_multihead_self_attention_with_rope` 和 `test_transformer_lm`。测试通过说明接口和参考数值一致；它不等于已经验证了大规模训练稳定性、吞吐或生成质量，后者仍需要训练曲线、验证集、显存和生成样例。
+
+## 13. 怎样选择一个新模型的配置
+
+1. 先确定数据和 token budget，而不是先决定参数量。
+2. 用 `d_model`、层数、head 数和 `d_ff` 算参数与激活显存。
+3. 从 pre-norm、RMSNorm、SwiGLU、RoPE 这些成熟起点开始。
+4. 再根据训练稳定性决定是否加 QK-Norm、z-loss 或 soft-capping。
+5. 如果生成成本是瓶颈，再考虑 GQA、MQA 或滑动窗口。
+6. 每次只改变一个主要因素，保留相同 token 数、评估集和随机种子。
+
+这也解释了为什么我没有把 Assignment 1 的模型直接改成“最新模型”：作业目标是把每个张量和梯度路径写对，而第三讲的目标是学会从论文、数据和系统约束中做架构判断。先有一个可验证的 MHA + RoPE + SwiGLU baseline，才有资格比较更复杂的变体。
+
+## 14. 一页总结
+
+- **Pre-Norm** 让残差主干更容易传递梯度。
+- **RMSNorm** 只做均方根缩放，收益还取决于内存访问。
+- **SwiGLU** 用一条分支门控另一条分支，常把 `d_ff` 从 `4D` 缩到约 `8D/3`。
+- **RoPE** 用二维旋转让 QK 点积自然依赖相对位置差。
+- **MHA/GQA/MQA** 的主要差异是 Q 与 KV head 数的关系，直接影响 KV Cache。
+- **词表、宽深比、dropout、weight decay** 都是预算与系统约束下的折中。
+- **QK-Norm、z-loss、soft-capping** 解决的是 softmax/logit 失控风险。
+- **训练速度不等于 FLOPs**；内存移动、kernel 融合和缓存大小同样关键。
+
+### 资料与出处
+
+- [Stanford CS336 Lecture 3 PDF](https://github.com/stanford-cs336/lectures/blob/main/lecture_03.pdf)
+- [视频：CS336 第三课：Architectures](https://www.bilibili.com/video/BV11LEA6eEuj/?p=3)
+- [Stanford CS336 Assignment 1](https://github.com/stanford-cs336/assignment1-basics)
+- [RoFormer: Enhanced Transformer with Rotary Position Embedding](https://arxiv.org/abs/2104.09864)
+- [Shazeer, GLU Variants Improve Transformer](https://arxiv.org/abs/2002.05202)
+
+如果你还没读前面的实现文章，可以按这个顺序继续：[Tokenizer 与 BPE](/posts/cs336-train-bpe-performance) → [Transformer 从零实现](/posts/cs336-transformer-from-scratch) → [训练数学](/posts/cs336-loss-adamw-schedule) → [训练循环与 checkpoint](/posts/cs336-training-loop-checkpoint) → [文本生成实验](/posts/cs336-generation-and-experiments)。
+

@@ -30,10 +30,10 @@ test("首页呈现正式品牌、精选旧文且不会重复", async () => {
   assert.match(html, /记录技术、生活与思考/);
   assert.match(html, /src="\/og\.png"/);
   assert.match(html, /算法竞赛进阶指南：基本算法与数据结构/);
-  assert.match(html, /CS336 Transformer 从零实现：从张量形状到完整语言模型/);
   assert.match(html, /CS336 文本生成与实验分析：Greedy、Temperature、Top-p 与可复现性/);
   assert.match(html, /CS336 训练数学：从 Cross Entropy 到 AdamW、Warmup 与梯度裁剪/);
   assert.match(html, /CS336 训练循环：从 memmap Batch 到 Checkpoint 与可恢复实验/);
+  assert.match(html, /CS336 第三讲：现代大语言模型架构与超参数/);
   assert.doesNotMatch(html, /target="_top"/);
   assert.doesNotMatch(html, /\/_next\/static\/chunks\/link-[^"]+\.js/);
   assert.equal(
@@ -78,6 +78,7 @@ test("主要页面和聚合页均可渲染", async () => {
     "/posts/cs336-loss-adamw-schedule",
     "/posts/cs336-training-loop-checkpoint",
     "/posts/cs336-generation-and-experiments",
+    "/posts/cs336-lecture-03-modern-llm-architecture",
     "/posts/kimi-k3-architecture-from-zero",
     "/about",
     "/categories",
@@ -91,6 +92,22 @@ test("主要页面和聚合页均可渲染", async () => {
     const response = await render(path);
     assert.equal(response.status, 200, `${path} should render`);
   }
+});
+
+test("CS336 第三讲文章覆盖架构变体、超参数和推理成本", async () => {
+  const response = await render("/posts/cs336-lecture-03-modern-llm-architecture");
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /CS336 第三讲：现代大语言模型架构与超参数/);
+  assert.match(html, /Pre-Norm/);
+  assert.match(html, /SwiGLU/);
+  assert.match(html, /RoPE/);
+  assert.match(html, /QK-Norm/);
+  assert.match(html, /KV Cache/);
+  assert.match(html, /lecture_03\.pdf/);
+  assert.match(html, /BV11LEA6eEuj/);
+  assert.match(html, /class="katex-display"/);
+  assert.match(html, /data-rehype-pretty-code-figure/);
 });
 
 test("完整头像用于关于页、文章署名和站点图标", async () => {
